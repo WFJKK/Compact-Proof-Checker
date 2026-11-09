@@ -1004,7 +1004,7 @@ elab "rawGInterval " i:term : term => do
 
 @pytest.mark.parametrize("how,lean", [("by-name", BY_NAME), ("by-projection", BY_PROJECTION)])
 def test_the_interval_rule_for_general_networks_is_scored_only_in_the_maximum_knowledge_condition(work, tmp_path, how, lean):
-    """`I.ginterval`, the legacy lane's interval rule for general networks, is an operation of the maximum-knowledge
+    """`I.ginterval`, the fixed rules lane's interval rule for general networks, is an operation of the maximum-knowledge
     condition only (accept/allowlist-maximum.txt). Called once on a box of one input of the tiny attention
     network (charge 367: twice the forward pass's arithmetic, the lookups and the final comparison), it is
     scored under --knowledge maximum and refused scoring under the default, minimal condition, also when an
@@ -1051,7 +1051,7 @@ end Candidate.TokensCall
 
 
 def test_the_token_interval_rule_for_general_networks_is_scored_only_in_the_maximum_knowledge_condition(work, tmp_path):
-    """`I.gtokenIntervals`, the legacy lane's token_interval rule for general networks, is an operation of the
+    """`I.gtokenIntervals`, the fixed rules lane's token_interval rule for general networks, is an operation of the
     maximum-knowledge condition only. Called on one box of one input of the tiny attention network (charge 160
     to token_interval and 224 to tables, as the Python checker charges the leaf: scripts/test_gtokens_cost.py),
     it is scored under --knowledge maximum and refused scoring under the minimal condition."""

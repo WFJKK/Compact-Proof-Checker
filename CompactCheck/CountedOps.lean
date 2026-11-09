@@ -183,7 +183,7 @@ structure Interp : Type 1 where
   /-- The interval rule on a general network: the general checker's interval arithmetic over a box of
       inputs, charged as cost-v3 charges an interval leaf of a general network (`CostM.ginterval`,
       `CountedGeneral.lean`; its soundness is `CostM.ginterval_correct`). Allowed only in the
-      maximum-knowledge condition (`accept/allowlist-maximum.txt`): it is one of the legacy lane's rules
+      maximum-knowledge condition (`accept/allowlist-maximum.txt`): it is one of the fixed rules lane's rules
       for groups of inputs, supplied rather than found. -/
   ginterval : Graph → Task → Box → M B
   /-- The token_interval rule on a general network, for a list of leaves: per leaf, the general checker's

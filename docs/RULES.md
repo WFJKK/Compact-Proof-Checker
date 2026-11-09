@@ -1,8 +1,8 @@
-# The rules lane: proof files and the verified checker
+# The fixed rules lane: proof files and the verified checker
 
-In the rules lane a proof is a JSON file: a plan that splits the inputs into boxes and names a rule for
+In the fixed rules lane a proof is a JSON file: a plan that splits the inputs into boxes and names a rule for
 each box. This page describes the rules, what is proved about them, and the files that implement them.
-(The agent's code still calls this lane the legacy lane.) The overview is in the [README](../README.md).
+The overview is in the [README](../README.md).
 
 ## What is proved
 

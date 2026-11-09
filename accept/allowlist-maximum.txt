@@ -1,5 +1,5 @@
 # Additions to allowlist.txt in the maximum-knowledge condition (accept.py --knowledge maximum; the run setting
-# open_lane.knowledge in the pipeline). These are the legacy lane's rules for groups of inputs on networks
+# open_lane.knowledge in the pipeline). These are the fixed rules lane's rules for groups of inputs on networks
 # beyond linear maps, supplied as operations rather than found: proved sound and priced as cost-v3 prices the
 # leaf. The minimal-knowledge condition does not have them; a checker that uses one there is refused scoring.
 #

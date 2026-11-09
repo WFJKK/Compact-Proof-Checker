@@ -7,7 +7,7 @@ trust whoever wrote the proof, or the code that checked it.
 What it does:
 
 1. **Input.** A trained network, exported exactly from PyTorch (its graph and its weights), and a proof about
-   it. The proof is either a plan in a fixed format (the rules lane) or Lean code (the open lane).
+   it. The proof is either a plan in a prescribed format (the fixed rules lane) or Lean code (the open lane).
 2. **Check.** It rejects the proof with a reason, or accepts it with a certified count $`n`$: a proved lower
    bound on the number of inputs the network answers correctly.
 3. **Measure.** It reports the proof's length: how many operations checking the proof costs.
@@ -62,7 +62,7 @@ an integer times a power of two, so nothing is rounded), and the task.
  "weights": [{"name": "embedding.weight", "shape": [4, 8], "ints": [...], "exp": ...}, ...]}
 ```
 
-The rules lane reads this file directly; the open lane turns it into Lean definitions first (see below). Any
+The fixed rules lane reads this file directly; the open lane turns it into Lean definitions first (see below). Any
 network built from these operations works, at any size:
 
 - linear layers, sums and additions
@@ -94,13 +94,13 @@ Proofs bound it from below with exact computations (rational arithmetic, dyadic 
 enclosures of `exp`) together with theorems that carry the computed facts over to $`\mathbb{R}`$.
 
 In the open lane this statement, for the claimed $`n`$, is a theorem whose proof Lean's kernel checks. In the
-rules lane the checker is a Lean function, `checkProofFile`, and the theorem `checkProofFile_sound` says that
+fixed rules lane the checker is a Lean function, `checkProofFile`, and the theorem `checkProofFile_sound` says that
 whenever it returns $`n`$, the statement holds; `compactcheck` runs that function, compiled. Either way only
 Lean's three standard axioms are allowed (`propext`, `Classical.choice`, `Quot.sound`), so `sorry` and
 `native_decide` are out (Lean 4.35.0-rc4 with Mathlib). A verdict can be wrong only if one of the following
 is, and this is everything you have to trust:
 
-1. Lean's kernel; for the rules lane also Lean's compiler and the JSON reader `compactcheck` uses.
+1. Lean's kernel; for the fixed rules lane also Lean's compiler and the JSON reader `compactcheck` uses.
 2. `Spec.lean` and the files it rests on (`Eval.lean`, `Semantics.lean`, `Network.lean`, and the input
    spaces and labels in `Task.lean`): they say what correct means.
 3. `scripts/export_network.py`: the exported $`(g, w)`$ is the PyTorch model. `scripts/compare_floats.py`
@@ -125,7 +125,7 @@ inputs correctly, as defined in `Spec.lean`. They differ in what a proof is made
 is written by whoever hands in the proof (our agent or a person), green is checked in Lean, and grey is fixed
 code and data.
 
-### The rules lane
+### The fixed rules lane
 
 A proof is a JSON file: a plan that splits the inputs into boxes and names a rule for each box. `single` runs
 the network exactly on one input, `interval` bounds its outputs over a whole box at once, `token_interval`
@@ -193,7 +193,7 @@ To get a length as well as a count, D has to be written in a small counted langu
 charges for it, and D can't branch on what it learns, so the bill is the whole cost of the check. Details:
 [docs/OPEN_LANE.md](docs/OPEN_LANE.md) and [docs/COUNTED.md](docs/COUNTED.md).
 
-| | Rules lane | Open lane |
+| | Fixed rules lane | Open lane |
 | --- | --- | --- |
 | A proof is | a JSON plan: boxes and a rule for each | Lean code: a checker D plus proofs |
 | The reasoning comes from | rules written and proved once, here | whoever writes the proof |
@@ -209,8 +209,8 @@ How the objects of Gross et al. appear here:
 | model $`M`$ | graph $`g`$ with exact weights $`w`$, evaluated over $`\mathbb{R}`$ |
 | $`D`$, $`f`$ | uniform over all $`t \in X`$; $`f = 1`$ if the label's logit is strictly the largest |
 | $`\bar s(M)`$ | `numCorrect g w task` $`/\ \lvert X \rvert`$ |
-| computational part $`C`$ | rules lane: the checker run on the proof file; open lane: the candidate's D |
-| argument $`Q`$ | rules lane: `checkProofFile_sound`; open lane: the candidate's soundness theorem |
+| computational part $`C`$ | fixed rules lane: the checker run on the proof file; open lane: the candidate's D |
+| argument $`Q`$ | fixed rules lane: `checkProofFile_sound`; open lane: the candidate's soundness theorem |
 | trace of $`C(M)`$ | the checker's run; in the open lane the instance theorem, which the kernel evaluates |
 | length (FLOPs) | operations counted under our cost model, cost-v4 |
 
@@ -229,7 +229,7 @@ Write $`\ell = M_w(t) \in \mathbb{R}^m`$ for the logits on input $`t`$ and $`\la
 Every accepted proof gives a count $`n`$ with $`n \le \mathrm{numCorrect}`$, that is a bound $`b = n / \lvert X \rvert`$ on
 the accuracy.
 
-**Rules lane.** The proof file's tree is walked into leaves $`(B_1, r_1), \dots, (B_K, r_K)`$: each $`B_i`$ is a
+**Fixed rules lane.** The proof file's tree is walked into leaves $`(B_1, r_1), \dots, (B_K, r_K)`$: each $`B_i`$ is a
 box, a range of tokens $`[lo_p, hi_p]`$ at each position $`p`$, with its rule $`r_i`$, and every input lies in
 exactly one box (`walk_partition`). With
 
@@ -274,9 +274,9 @@ model, cost-v4 (the agent's `core/check/cost.py`, mirrored in Lean). A proof's l
   comparison, 3 for an `exp`, so a whole forward pass costs its number of operations. In the open lane this is
   the bill.
 - **Reading the proof.** The numbers the proof supplies for the check to compute with, one unit each: in the
-  open lane the certificate, in the rules lane the entries of the approximations.
+  open lane the certificate, in the fixed rules lane the entries of the approximations.
 
-The plan of a proof is not charged: in the open lane the code of D, in the rules lane the tree, the rule
+The plan of a proof is not charged: in the open lane the code of D, in the fixed rules lane the tree, the rule
 names and the flags of the proof file. Choosing what to check where is bookkeeping, not computing with the
 network's numbers, so it is capped in size instead (the description-size budget of D; a limit on the
 proof file's numbers, strings and tree nodes).
@@ -296,12 +296,12 @@ where the bill is the total charge of every operation D executes on the real wei
 | `selectV`, `bnot`, `band`, `bor` | 1 |
 | `exp` (an interval enclosing $`e^x`$) | 3 |
 | `charge`, with an amount $`k`$ | $`k`$ |
-| `single`, `gsingle` | one exact forward pass, as the rules lane charges a single leaf |
-| `interval`, `ginterval`, `gtokenIntervals` | as the rules lane charges the leaf |
+| `single`, `gsingle` | one exact forward pass, as the fixed rules lane charges a single leaf |
+| `interval`, `ginterval`, `gtokenIntervals` | as the fixed rules lane charges the leaf |
 
 The claimed bill is part of the instance theorem, so the kernel confirms it.
 
-**Rules lane.** $`L`$ is the sum of these terms:
+**Fixed rules lane.** $`L`$ is the sum of these terms:
 
 - $`E`$, for reading the weights;
 - read: the numbers of the approximations (every value, every entry of a low-rank factor, the start, end and
@@ -318,7 +318,7 @@ with the same formulas as the agent's Python checker (for linear networks so far
 charge of each rule is compared with Python's in tests).
 
 **Comparing the two lanes.** The same proof costs the same in both lanes: computing is priced by the same
-functions (the open lane's `single` charges the rules lane's `singleCost`), supplied numbers are read at one
+functions (the open lane's `single` charges the fixed rules lane's `singleCost`), supplied numbers are read at one
 unit each, and neither lane charges its plan.
 
 **Example.** Brute force has one forward pass per input. On the tiny max-of-2 network ($`V = 8`$, $`k = 2`$,
@@ -326,7 +326,7 @@ width 4, $`\lvert X \rvert = 64`$) a forward pass costs 2·4 for the embedding l
 two linear maps and 7 for the comparison, so $`c_{\mathrm{fwd}} = 63`$, and $`E = 80`$.
 
 - Open lane: $`L = 64 \cdot 63 + 80 = 4112`$, with an empty certificate.
-- Rules lane: the same $`L = 4112`$; the split tree and its 64 rule names are the plan and cost nothing.
+- Fixed rules lane: the same $`L = 4112`$; the split tree and its 64 rule names are the plan and cost nothing.
 
 Both certify all 64 inputs.
 
@@ -344,7 +344,7 @@ def numCorrect (g : Graph) (w : Weights ℚ) (task : Task) : Nat :=
   (allInputs task.space).countP fun x => decide (Correct g w task x)
 ```
 
-The count of the rules lane (`CompactCheck/Check.lean`), with `boxSize` the product of the range lengths:
+The count of the fixed rules lane (`CompactCheck/Check.lean`), with `boxSize` the product of the range lengths:
 
 ```lean
 def checkLeaves (g : Graph) (w : Weights Rat) (task : Task) (approxs : List Approx) :

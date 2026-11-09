@@ -6,7 +6,7 @@ import CompactCheck.CountedGeneral
 
 `Tokens.lean` checks a token_interval leaf as `core/check/tokens.py` does. This file adds what the
 Python checker charges for it, so that the rule can be a counted operation of the open lane (the
-maximum-knowledge condition) at exactly the legacy lane's price.
+maximum-knowledge condition) at exactly the fixed rules lane's price.
 
 Python charges a token_interval leaf in two places:
 

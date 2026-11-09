@@ -87,11 +87,11 @@ TRUSTED_PREFIXES = ("CompactCheck.", "Mathlib.")
 KINDS = ("performance", "auxiliary")  # a proof of Target, or a lemma: accepted with no count and no score
 COST_MODEL = "cost-v3"  # the prices (CountedCheck.lean, core/check/cost.py of the pipeline): unchanged since the open lane began
 # the open lane's policy around those prices, versioned: what a checker may use for free and the budgets.
-# v7 (23 October 2026, evening): the maximum condition adds the legacy lane's token_interval rule for general
+# v7 (23 October 2026, evening): the maximum condition adds the fixed rules lane's token_interval rule for general
 # networks, `Interp.gtokenIntervals` (a list of leaves per call; the rows that depend on their token alone are
 # charged once per call, as cost-v3 charges them once per proof).
-# v6 (23 October 2026, afternoon): knowledge conditions, minimal (the base allowlist) and maximum (plus the legacy
-# lane's interval rule for general networks, `Interp.ginterval`, from allowlist-maximum.txt), chosen by --knowledge
+# v6 (23 October 2026, afternoon): knowledge conditions, minimal (the base allowlist) and maximum (plus the fixed
+# rules lane's interval rule for general networks, `Interp.ginterval`, from allowlist-maximum.txt), chosen by --knowledge
 # and part of the policy digest; the closure check counts a primitive projection of a trusted structure as its
 # projection function; gsingle charges every operation (the review of the afternoon).
 # v5 (23 October 2026): the single rule for general networks (attention), `Interp.gsingle`, on the
@@ -110,7 +110,7 @@ CHECK_TIMEOUT_S = 3600
 MEMORY_MB = 12288  # virtual: Mathlib's .olean files are mapped into memory
 ALLOWLIST = LEAN_PROJECT / "accept" / "allowlist.txt"
 # The knowledge conditions (docs/COUNTED.md, "Knowledge conditions"): minimal is the base language; maximum adds
-# the legacy lane's rules for groups of inputs as operations (allowlist-maximum.txt). Set by --knowledge; part of
+# the fixed rules lane's rules for groups of inputs as operations (allowlist-maximum.txt). Set by --knowledge; part of
 # the policy digest and recorded in every receipt, so a run's frontier never mixes the two.
 ALLOWLIST_MAXIMUM = LEAN_PROJECT / "accept" / "allowlist-maximum.txt"
 KNOWLEDGE_CONDITIONS = ("minimal", "maximum")

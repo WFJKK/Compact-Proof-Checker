@@ -176,7 +176,7 @@ proof failed this way). The test states its lemma for every list of indices and 
 `single` runs the linear checker; on a network with attention its cost function has no price for softmax
 and the rule fails, so on such a network not even brute force could be written. `gsingle graph task x`
 (`CountedGeneral.lean`) is the single rule for every network the general checker of `General.lean`
-follows, the rules lane's checker for these networks (`checkGeneral_sound`): it runs the network on one
+follows, the fixed rules lane's checker for these networks (`checkGeneral_sound`): it runs the network on one
 input with that checker's exact dyadic arithmetic, `exp` and softmax enclosed in rational bounds, and
 certifies the input if the label's lower bound is above every other output's upper bound. Its charge is
 `cost-v3`'s for a `single` leaf of a general network (`core/check/general.py`):
@@ -234,7 +234,7 @@ service; `open_lane.knowledge` in the pipeline's run config):
 - **minimal**: the base allowlist (`accept/allowlist.txt`). On a network with attention a checker has
   `gsingle`, the arithmetic and comparison primitives and `exp`; any bound over a group of inputs it builds
   and proves itself.
-- **maximum**: the base allowlist plus `accept/allowlist-maximum.txt`: the rules lane's group rules (one
+- **maximum**: the base allowlist plus `accept/allowlist-maximum.txt`: the fixed rules lane's group rules (one
   bound for a whole box of inputs) on general networks, as operations, proved sound and priced as `cost-v3`
   prices the leaf: `ginterval` (policy v6) and `gtokenIntervals` (policy v7). `token_convex` (not yet in
   Lean) is to follow.
@@ -332,7 +332,7 @@ The mapping to `cost-v3`'s categories: `single`, `interval`, `gsingle` (billed a
 operations, `extract`
 and `read` as above, the arithmetic categories through the primitives. `tree` has no counterpart: the
 structure of a scored proof is its program, bounded by the literal budget below rather than charged. The
-rules lane does not charge a proof file's plan either, so the same proof costs the same in both lanes.
+fixed rules lane does not charge a proof file's plan either, so the same proof costs the same in both lanes.
 
 ## General-layer safeguards
 
@@ -375,6 +375,6 @@ and the count equals the Python count (`scripts/test_cost.py`). Its soundness co
 ## What stays open
 
 `token_convex` for general networks as a counted operation of the maximum-knowledge condition (needed to
-reproduce the attention frontiers at their rules-lane price); the input-free operations of a general network in
+reproduce the attention frontiers at their price in the fixed rules lane); the input-free operations of a general network in
 `extract`; the `interval` operation with an approximation; a literal budget calibrated on more than the
 brute-force example.
