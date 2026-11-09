@@ -1,44 +1,91 @@
 # Compact-Proof-Checker
 
-This repo checks compact proofs about small neural networks. A compact proof shows that a trained network
-gets at least n of its inputs right, with less work than running the network on every input. You give it a
-network and a proof, and it tells you whether the proof is correct, how many inputs it certifies and how
-long it is.
+This repo checks compact proofs of model performance, in the sense of Gross et al.,
+[Compact Proofs of Model Performance via Mechanistic Interpretability](https://arxiv.org/abs/2406.11779)
+(2024). There, a model $`M`$ is evaluated on input-label pairs $`(l, t)`$ drawn from a distribution $`D`$, with a
+score $`f(l, M(t))`$, and the quantity of interest is the expected performance
 
-A tiny example. Take a network that reads two tokens, each 0 or 1, and should output the larger one. Brute
-force runs it on all four inputs: 12 arithmetic operations. A smarter proof notices that only the
-difference between the two output scores matters, and checks two inequalities instead: 6 operations. Both
-prove the same thing; the second one is more compact. On bigger networks the gap grows with the number of
-inputs. Short proofs usually come from understanding how the network computes, which is why we care about
-them.
+```math
+\bar s(M) = \mathbb{E}_{(l,t) \sim D}\, f(l, M(t)).
+```
+
+A proof that $`\bar s(M) \ge b`$ is a pair $`(C, Q)`$: a program $`C`$ that takes the model's weights and returns
+a number, and an argument $`Q`$ that this number is a lower bound for every model of the same shape,
+
+```math
+\forall M' :\ C(M') \le \bar s(M').
+```
+
+Running $`C`$ on the actual weights gives the bound $`b = C(M)`$, and the length of the proof is the cost of
+that run. Brute force evaluates $`M`$ on every input. A compact proof uses structure in $`M`$ to get a good bound
+with much less work, and that is why short proofs tend to come with an understanding of how the model
+computes.
+
+We use $`D`$ uniform over a finite input set $`X`$, and $`f = 1`$ when the label's logit is strictly the largest,
+$`0`$ otherwise, so $`\bar s`$ is the accuracy. You hand in a network and a proof; you get back whether the proof
+is valid, the bound it certifies (reported as a count $`n = b \cdot |X|`$) and its length.
 
 The Lean library inside is called CompactCheck, and its command-line program `compactcheck`.
 
 ## What it works for
 
-A network is data here, not code: a list of operations plus its exact weights, exported from PyTorch by
-`scripts/export_network.py`. Any network built from these operations works, at any size:
+The checker never runs PyTorch. `scripts/export_network.py` traces a model of the agent's zoo with
+torch.fx and writes a JSON network file: the graph as a list of operations, every weight exactly (a float is
+an integer times a power of two, so nothing is rounded), and the task.
+
+```json
+{"format": "compactcheck-network-v1", "network": "max2_tiny-v8-s0", "task": "max",
+ "graph": {"positions": 2, "values": 8, "nodes": [{"op": "input"}, {"op": "sum", ...}, ...], "output": ...},
+ "weights": [{"name": "embedding.weight", "shape": [4, 8], "ints": [...], "exp": ...}, ...]}
+```
+
+The rules lane reads this file directly; the open lane turns it into Lean definitions first (see below). Any
+network built from these operations works, at any size:
 
 - linear layers, sums and additions
 - matrix products, and entrywise addition, subtraction, multiplication and negation
 - indexing and reshaping (index, transpose, unsqueeze, expand, cat, stack)
 - `exp` and `softmax`
 
-That covers linear models and attention-only transformers, and our xorformer. MLPs with ReLU or GELU, and
-LayerNorm, are not in yet. Inputs are short token sequences over a small vocabulary, and the tasks are max,
-min and majority.
+That covers linear models and attention-only transformers, and our xorformer. Inputs are short token
+sequences over a small vocabulary, $`X = \{0, \dots, V-1\}^k`$, and the tasks are max, min and majority.
 
-## Where Lean comes in
+To cover fully realistic models we will have to add MLP blocks with ReLU or GELU, LayerNorm (which needs
+square roots and division), and tasks beyond the three built in. Each new operation needs its meaning in the
+specification, support in the exporter, and rules with proofs in the checker. We will do this at a later
+point.
 
-Everything that decides whether a proof is correct is written in Lean 4 (4.35.0-rc4, with Mathlib). What it
-means for the network to answer an input correctly is defined once, in `CompactCheck/Spec.lean`: run the
-network's graph in exact real arithmetic, with the real exponential, and check that the right answer gets
-strictly the highest score. `numCorrect` counts the inputs where this holds. Nobody computes it; proofs show
-lower bounds on it.
+## Verifiability
 
-Every verdict of this repo is a theorem about `numCorrect`, checked by Lean's kernel and using only Lean's
-standard axioms. So you don't have to trust the code that checks proofs, only the definition and the script
-that exports the network.
+Both lanes end in the same statement about the exported graph $`g`$, its exact weights $`w`$ and the task:
+
+```lean
+n ≤ numCorrect graph weights task
+```
+
+`numCorrect` is defined in `CompactCheck/Spec.lean` over the real numbers. The meaning of every operation is
+written once for an arbitrary number type (`Eval.lean`, `Semantics.lean`) and used here with $`\mathbb{R}`$
+and the real exponential; `numCorrect` counts the inputs $`t \in X`$ where the label's logit is strictly
+larger than every other logit (ties count as wrong). It is $`|X| \cdot \bar s`$, and nothing ever evaluates it.
+Proofs bound it from below with exact computations (rational arithmetic, dyadic intervals, rational
+enclosures of `exp`) together with theorems that carry the computed facts over to $`\mathbb{R}`$.
+
+In the open lane this statement, for the claimed $`n`$, is a theorem whose proof Lean's kernel checks. In the
+rules lane the checker is a Lean function, `checkProofFile`, and the theorem `checkProofFile_sound` says that
+whenever it returns $`n`$, the statement holds; `compactcheck` runs that function, compiled. Either way only
+Lean's three standard axioms are allowed (`propext`, `Classical.choice`, `Quot.sound`), so `sorry` and
+`native_decide` are out (Lean 4.35.0-rc4 with Mathlib). A verdict can be wrong only if one of the following
+is, and this is everything you have to trust:
+
+1. Lean's kernel; for the rules lane also Lean's compiler and the JSON reader `compactcheck` uses.
+2. `Spec.lean` and the files it rests on (`Eval.lean`, `Semantics.lean`, `Network.lean`, and the input
+   spaces and labels in `Task.lean`): they say what correct means.
+3. `scripts/export_network.py`: the exported $`(g, w)`$ is the PyTorch model. `scripts/compare_floats.py`
+   checks Lean's semantics against PyTorch in float64 on every development network.
+4. For the open lane: `scripts/make_protected.py` with the check of its output, `AcceptMain.lean`, and
+   `scripts/accept.py` with its sandbox.
+
+Everything else, both checkers and every submitted proof included, is checked rather than trusted.
 
 ## Related repos
 
@@ -85,9 +132,9 @@ flowchart TD
 ```
 
 The agent writes proof files with Python recipes. Its Python checker reads them during a run and gives the
-numbers fast; the Lean checker (`compactcheck`) reads the same files and gives the same numbers with a theorem behind them. If
-the two ever disagree, believe Lean. (The agent's code still calls this the legacy lane.) All the rules in
-detail: [docs/RULES.md](docs/RULES.md).
+numbers fast; the Lean checker (`compactcheck`) reads the same files and gives the same numbers with a
+theorem behind them. If the two ever disagree, believe Lean. (The agent's code still calls this the legacy
+lane.) All the rules in detail: [docs/RULES.md](docs/RULES.md).
 
 ### The open lane
 
@@ -130,32 +177,184 @@ charges for it, and D can't branch on what it learns, so the bill is the whole c
 | Checked by | the Lean checker (and the agent's Python checker) | the Lean kernel |
 | Can express | what the rules allow | any argument you can prove in Lean |
 
-## What the numbers mean
+## Count and length
 
-- **Count**: how many inputs the proof certifies. It is always a lower bound on `numCorrect`. In the rules lane
-  the checker adds up the sizes of the boxes whose rule succeeds. In the open lane it is the claim in the
-  target, which the proof has to establish.
-- **Length**: how much work checking the proof costs, in the units of our cost model (cost-v3): roughly one per
-  arithmetic operation, plus one per weight read and one per number the proof hands over. In the rules lane
-  Lean computes it with the same formulas as the agent's Python checker (for linear networks so far; on
-  attention networks the charge of each rule is compared with Python's in tests). In the open lane it is the
-  bill of D on the real weights, plus the number of weights, plus the numbers in the certificate, and the
-  kernel confirms the bill.
+How the objects of Gross et al. appear here:
 
-For example, brute force on the tiny max-of-2 network (2 positions, 8 tokens, 64 inputs) runs the network 64
-times at 63 operations each and reads 80 weights: count 64, length 4,112.
+| Gross et al. | Here |
+| --- | --- |
+| model $`M`$ | graph $`g`$ with exact weights $`w`$, evaluated over $`\mathbb{R}`$ |
+| $`D`$, $`f`$ | uniform over all $`t \in X`$; $`f = 1`$ if the label's logit is strictly the largest |
+| $`\bar s(M)`$ | `numCorrect g w task` $`/\ \lvert X \rvert`$ |
+| computational part $`C`$ | rules lane: the checker run on the proof file; open lane: the candidate's D |
+| argument $`Q`$ | rules lane: `checkProofFile_sound`; open lane: the candidate's soundness theorem |
+| trace of $`C(M)`$ | the checker's run; in the open lane the instance theorem, which the kernel evaluates |
+| length (FLOPs) | operations counted under our cost model, cost-v3 |
 
-## What has to be trusted
+### Count
 
-- `CompactCheck/Spec.lean` and the files it rests on (`Eval.lean`, `Semantics.lean`, `Network.lean`, and the
-  input spaces and labels in `Task.lean`): they say what correct means.
-- `scripts/export_network.py`, which writes down the network PyTorch traces, with its exact weights.
-  `scripts/compare_floats.py` checks Lean's semantics against PyTorch on every development network.
-- For the open lane, also `scripts/make_protected.py` with the check of its output, `AcceptMain.lean`, and
-  `scripts/accept.py` with its sandbox.
-- The Lean toolchain.
+Write $`\ell = M_w(t) \in \mathbb{R}^m`$ for the logits on input $`t`$ and $`\lambda(t)`$ for its label. Then
 
-The checkers themselves need no trust: the theorems are about them.
+```math
+\mathrm{Correct}(t) \iff \lambda(t) < m \text{ and } \ell_j < \ell_{\lambda(t)} \text{ for all } j \ne \lambda(t),
+```
+
+```math
+\mathrm{numCorrect} = \lvert \{ t \in X : \mathrm{Correct}(t) \} \rvert.
+```
+
+Every accepted proof gives a count $`n`$ with $`n \le \mathrm{numCorrect}`$, that is a bound $`b = n / |X|`$ on
+the accuracy.
+
+**Rules lane.** The proof file's tree is walked into leaves $`(B_1, r_1), \dots, (B_K, r_K)`$: each $`B_i`$ is a
+box, a range of tokens $`[lo_p, hi_p]`$ at each position $`p`$, with its rule $`r_i`$, and every input lies in
+exactly one box (`walk_partition`). With
+
+```math
+|B| = \prod_p (hi_p - lo_p + 1),
+```
+
+the count is the size of the boxes whose rule succeeds:
+
+```math
+n = \sum_{i \,:\, r_i \text{ accepts } B_i} |B_i|.
+```
+
+With the symmetry rule, $`n`$ counts the inputs whose sorted version lies in an accepted box.
+`checkProofFile_sound` proves $`n \le \mathrm{numCorrect}`$ for every network file and every proof file.
+
+**Open lane.** $`C`$ is the candidate's checker D run by the counting interpreter, and $`Q`$ is its soundness
+theorem, which the service states itself, for all weights and certificates:
+
+```lean
+∀ w c n cost, CostM.exec (D Interp.counting) ⟨w, c⟩ = some (n, cost) → n ≤ numCorrect graph w task
+```
+
+The instance theorem is the trace of $`C(M)`$, and the kernel checks it by evaluating D on the protected
+weights:
+
+```lean
+CostM.billed (D Interp.counting) ⟨weights, cert⟩ = some (claimedCount, claimedBill)
+```
+
+Together they give the target `claimedCount ≤ numCorrect graph weights task`.
+
+### Length
+
+Gross et al. measure a proof by the cost of running $`C`$ on the model. We count operations under cost-v3 (the
+agent's `core/check/cost.py`, mirrored in Lean): one unit per arithmetic operation or comparison on a number
+of the network, $`E`$ (the number of parameters) for reading the weights once, and one unit per number the
+proof hands over.
+
+**Open lane.** With $`\mathrm{cert}`$ the certificate (numbers the proof passes to D),
+
+```math
+L = \mathrm{bill} + E + |\mathrm{cert}|,
+```
+
+where the bill is the total charge of every operation D executes on the real weights:
+
+| Operations | Charge |
+| --- | --- |
+| `weight`, `weightShape`, `weightSize`, `cert`, `certSize`, `zero` | 0 |
+| `lit`, `add`, `sub`, `muladd`, `neg`, `min`, `max`, `lt`, `le`, `eq` | 1 |
+| `selectV`, `bnot`, `band`, `bor` | 1 |
+| `exp` (an interval enclosing $`e^x`$) | 3 |
+| `charge`, with an amount $`k`$ | $`k`$ |
+| `single`, `gsingle` | one exact forward pass, as cost-v3 charges a single leaf |
+| `interval`, `ginterval`, `gtokenIntervals` | as cost-v3 charges the leaf |
+
+The claimed bill is part of the instance theorem, so the kernel confirms it.
+
+**Rules lane.** $`L`$ is the sum of these terms:
+
+- $`E`$, for reading the weights;
+- read: the numbers, strings and booleans in the proof file;
+- tree: the number of nodes of the split tree;
+- single: the number of single leaves times $`c_{\mathrm{fwd}}`$, the cost of one exact forward pass;
+- interval: the sum of the interval charges of the leaves whose label is constant on the box;
+- contract, approximate: building the contracted maps and the approximations;
+- symmetry: the number of accepted leaves, when the rule is on.
+
+On a linear network, $`c_{\mathrm{fwd}}`$ adds up, over the operations the output depends on: $`k \cdot out`$ for
+a linear map on the one-hot input (a lookup at each position), $`\mathrm{size}(s) \cdot out`$ for a linear map
+on a tensor of shape $`s`$, plus the output size for a bias, $`\mathrm{size} \cdot (n-1)`$ for a sum over a
+dimension of size $`n`$, the size for an addition, and $`m - 1`$ for the final comparison. Lean computes this
+with the same formulas as the agent's Python checker (for linear networks so far; on attention networks the
+charge of each rule is compared with Python's in tests).
+
+**Example.** Brute force has one forward pass per input, so in the open lane
+
+```math
+L = |X| \cdot c_{\mathrm{fwd}} + E.
+```
+
+On the tiny max-of-2 network ($`V = 8`$, $`k = 2`$, width 4, $`|X| = 64`$) a forward pass costs 2·4 for the
+embedding lookups, 4·4 and 4·8 for the two linear maps and 7 for the comparison, so $`c_{\mathrm{fwd}} = 63`$.
+With $`E = 80`$ that gives $`L = 64 \cdot 63 + 80 = 4112`$, with count 64.
+
+### In the code
+
+The definition of correct (`CompactCheck/Spec.lean`):
+
+```lean
+def Correct (g : Graph) (w : Weights ℚ) (task : Task) (x : Input) : Prop :=
+  ∃ out : Tensor ℝ, realOutput g w x = some out ∧ out.shape = [1, out.data.size] ∧
+    task.label x < out.data.size ∧
+    ∀ j < out.data.size, j ≠ task.label x → out.get j < out.get (task.label x)
+
+def numCorrect (g : Graph) (w : Weights ℚ) (task : Task) : Nat :=
+  (allInputs task.space).countP fun x => decide (Correct g w task x)
+```
+
+The count of the rules lane (`CompactCheck/Check.lean`), with `boxSize` the product of the range lengths:
+
+```lean
+def checkLeaves (g : Graph) (w : Weights Rat) (task : Task) (approxs : List Approx) :
+    List Leaf → Except String Nat
+  | [] => .ok 0
+  | leaf :: rest =>
+    match checkLeaves g w task approxs rest with
+    | .error e => .error e
+    | .ok n =>
+      match leafOk g w task approxs leaf with
+      | .error e => .error e
+      | .ok ok => .ok (if ok then n + boxSize leaf.box else n)
+```
+
+The bill of the open lane (`CompactCheck/Counted.lean`): a counted computation threads a bill through, every
+primitive adds its charge, and `billed` runs a checker from an empty bill and returns the result with the
+total:
+
+```lean
+structure CostM (α : Type) where
+  run : Env → Cost → Option (α × Cost)
+
+def qmuladd (cat : String) (acc a b : Q) : CostM Q :=
+  ⟨fun _ c => some (⟨acc.val + a.val * b.val⟩, c.add cat 1)⟩
+
+def billed (x : CostM α) (env : Env) : Option (α × Nat) :=
+  (x.exec env).map fun p => (p.1, p.2.total)
+```
+
+A checker is written for an abstract interpreter, so it can only touch numbers through charged operations
+(`CompactCheck/CountedOps.lean`); the service runs it with `Interp.counting`, whose operations are the
+primitives above:
+
+```lean
+abbrev Checker := (I : Interp) → I.M I.N
+```
+
+The service builds the soundness and instance statements as Lean terms (`soundType` and `instanceType` in
+`AcceptMain.lean`), asks the kernel to accept the candidate's theorems at exactly those types, and computes
+the length (`scripts/accept.py`):
+
+```python
+extract = extraction_cost(net)       # E: one per parameter of the model
+read = len(scored["certificate"])    # one per number of the certificate
+...
+out.update(status="scored", bill=scored["claimed_bill"], length=scored["claimed_bill"] + extract + read)
+```
 
 ## Build and use
 
