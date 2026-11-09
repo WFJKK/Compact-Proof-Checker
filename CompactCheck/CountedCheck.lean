@@ -2,7 +2,7 @@ import CompactCheck.Check
 import CompactCheck.Counted
 
 /-!
-# The checker, with its bill: `cost-v3` for proof files
+# The checker, with its bill: `cost-v4` for proof files
 
 `checkProofCounted` certifies exactly what `checkProof` certifies (it calls it) and charges what the
 Python checker charges for the same proof, operation by operation, as `core/check/cost.py` and the charge
@@ -13,22 +13,17 @@ bill here equals the Python length to the unit (`scripts/test_cost.py`).
 
 Soundness is `check_sound`: the count is `checkProof`'s. The bill does not affect it.
 
-Categories, as the Python checker names them: `read`, `extract`, `contract`, `approximate`, `tree`,
-`single`, `interval`, `symmetry`.
+Categories, as the Python checker names them: `extract`, `read`, `contract`, `approximate`, `single`,
+`interval`. Under `cost-v4` the plan is free, as a checker's code is in the open lane: the split tree,
+the leaf rules, the contraction chains, the symmetry flag and the names cost nothing (`cost-v3` charged
+1 per tree node, 1 per number, string or boolean of the file and 1 per leaf certified under symmetry), and
+`read` charges only the numbers the proof supplies, the entries of its approximations. So the same proof
+costs the same in both lanes.
 
 This file uses only core Lean.
 -/
 
 namespace CompactCheck
-
-/-- The nodes of a split tree, as the Python walk counts them. -/
-def SplitTree.nodeCount : SplitTree → Nat
-  | .leaf _ => 1
-  | .split _ _ children => 1 + nodeCountList children
-where
-  nodeCountList : List SplitTree → Nat
-    | [] => 0
-    | t :: ts => nodeCount t + nodeCountList ts
 
 /-- The parameters of the network: `extract`, E. -/
 def paramCount (w : Weights Rat) : Nat :=
@@ -88,7 +83,14 @@ def contractCost (g : Graph) (w : Weights Rat) (chain : List Nat) : Option Nat :
 
 /-! ## The approximate rule's charges -/
 
-/-- Reading an approximation: `2` per entry for the error, plus the low-rank product or the segment
+/-- The `read` charge of an approximation: 1 per number the file supplies for it (every value of a
+    dense form, every entry of a low-rank form's two factors, the start, end and value of every segment). -/
+def approxReadCost : RawForm → Nat
+  | .dense values => (values.map List.length).sum
+  | .lowRank F G => (F.map List.length).sum + (G.map List.length).sum
+  | .rowSegments rows => 3 * (rows.map List.length).sum
+
+/-- Checking an approximation: `2` per entry for the error, plus the low-rank product or the segment
     index. -/
 def approxBuildCost (W : Tensor Rat) : RawForm → Nat
   | .dense _ => 2 * W.data.size
@@ -270,12 +272,12 @@ def intervalCost (g : Graph) (w : Weights Rat) (box : Box) (l : Nat) (approx : O
 
 /-! ## The whole proof -/
 
-/-- The bill of a proof file, by category, as the Python checker would charge it; `none` where the
-    Python checker would reject the proof (`checkProof` rejects it too). `nScalars` is the proof file's
-    number of numbers, strings and booleans (`countScalars`). -/
-def proofCost (g : Graph) (w : Weights Rat) (task : Task) (proof : ProofFile) (nScalars : Nat) :
+/-- The bill of a proof file, by category, as the Python checker would charge it; an error where the
+    Python checker would reject the proof (`checkProof` rejects it too). The plan (tree, rules, chains,
+    symmetry flag, names) is not charged. -/
+def proofCost (g : Graph) (w : Weights Rat) (task : Task) (proof : ProofFile) :
     Except String Cost := do
-  let c : Cost := [("read", nScalars), ("extract", paramCount w)]
+  let c : Cost := [("extract", paramCount w)]
   -- contractions, applied one by one as `contractAll` applies them, so that later chains see the
   -- contracted graph; each chain is billed on the graph it meets
   let (g', w', _, _, contractC) ← proof.contractions.foldlM (init := (g, w, ([] : List Nat), 0, 0))
@@ -290,26 +292,28 @@ def proofCost (g : Graph) (w : Weights Rat) (task : Task) (proof : ProofFile) (n
     | .ok as => pure as
     | .error e => throw s!"approximate: {e}"
   let raws := proof.approximations.map (·.form)
+  let readC := (raws.map approxReadCost).sum
+  let c := c.add "read" readC
   let approxC := (List.zip approxs raws).foldl (fun acc (a, raw) => acc + approxBuildCost a.W raw) 0
   let c := c.add "approximate" approxC
-  -- the tree
-  let c := c.add "tree" proof.tree.nodeCount
+  -- the tree: walked for free
   let leaves ← match walk proof.tree (rootBox task.space) with
     | .ok ls => pure ls
     | .error e => throw s!"tree: {e}"
   let withRaw (name : String) : Option (Approx × RawForm) :=
     (List.zip approxs raws).find? (·.1.name == name)
-  let (c, accepted) ← leaves.foldlM (init := (c, 0)) fun (c, accepted) leaf => do
+  -- every leaf's rule is charged; which leaves are accepted, and what they certify (under symmetry
+  -- too), is counted for free
+  leaves.foldlM (init := c) fun c leaf => do
     match leaf.rule with
-    | .skip => pure (c, accepted)
+    | .skip => pure c
     | .single =>
-      let some x := boxInput leaf.box | throw "single: the leaf holds more than one input"
+      let some _ := boxInput leaf.box | throw "single: the leaf holds more than one input"
       let some singleC := singleCost g' w' | throw "single: the forward pass could not be billed"
-      let ok := singleOk g' w' task x
-      pure (c.add "single" singleC, if ok then accepted + 1 else accepted)
+      pure (c.add "single" singleC)
     | .interval name =>
       match task.constantLabel leaf.box with
-      | none => pure (c, accepted)
+      | none => pure c
       | some l =>
         let a ← match name with
           | none => pure none
@@ -319,26 +323,21 @@ def proofCost (g : Graph) (w : Weights Rat) (task : Task) (proof : ProofFile) (n
             | none => throw s!"interval: unknown approximation {n}"
         let some ic := intervalCost g' w' leaf.box l a
           | throw s!"interval: the leaf {repr leaf.box} could not be billed"
-        let ok := match leafOk g' w' task approxs leaf with
-          | .ok b => b
-          | .error _ => false
-        pure (c.add "interval" ic, if ok then accepted + 1 else accepted)
+        pure (c.add "interval" ic)
     | .tokenInterval =>
       -- as Python: no charge when the label is not constant; otherwise `checkProof` has already
       -- rejected the proof, since the rule is for networks beyond linear maps
       match task.constantLabel leaf.box with
-      | none => pure (c, accepted)
+      | none => pure c
       | some _ => throw "token_interval: the rule is for networks beyond linear maps"
-  let c := if proof.symmetry then c.add "symmetry" accepted else c
-  pure c
 
-/-- The checker with its bill: `checkProof`'s count, and the proof's length under `cost-v3`. -/
-def checkProofCounted (g : Graph) (w : Weights Rat) (task : Task) (proof : ProofFile) (nScalars : Nat) :
+/-- The checker with its bill: `checkProof`'s count, and the proof's length under `cost-v4`. -/
+def checkProofCounted (g : Graph) (w : Weights Rat) (task : Task) (proof : ProofFile) :
     Except String (Nat × Cost) :=
   match checkProof g w task proof with
   | .error e => .error e
   | .ok n =>
-    match proofCost g w task proof nScalars with
+    match proofCost g w task proof with
     | .ok c => .ok (n, c)
     | .error e => .error s!"the bill could not be computed: {e}"
 

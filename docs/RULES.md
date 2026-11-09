@@ -151,7 +151,7 @@ Paths are relative to `CompactCheck/` unless they say otherwise.
 | `TokensLeafSound.lean` | the margin bound, the leaf, and `checkGeneral_sound` |
 | `FileSound.lean` | `checkProofFile_sound`: both checkers, as the program runs them |
 | `Counted.lean` | the counted language of the open lane: a monad whose every operation on a number is charged |
-| `CountedCheck.lean` | the checker with its bill: `cost-v3` for proof files (`compactcheck cost`) |
+| `CountedCheck.lean` | the checker with its bill: `cost-v4` for proof files (`compactcheck cost`) |
 | `CountedOps.lean` | the checker's rules as charged operations, each with its specification |
 | `CountedGeneral.lean`, `CountedGeneralSound.lean` | the single and interval rules on attention networks as counted operations (`gsingle`; `ginterval`, maximum-knowledge condition only), and the soundness of the token_interval operation |
 | `TokensCost.lean` | the token_interval rule priced as `cost-v3` prices it (its rows kept once per call), as the counted operation `gtokenIntervals` (maximum-knowledge condition only) |
@@ -197,7 +197,7 @@ The scripts need the pipeline's Python environment (numpy, torch).
     # check a proof file; the last line is {"certified": n}
     .lake/build/bin/compactcheck max2-v64-s0.json proof.json
 
-    # check a proof and bill it under cost-v3 (linear networks for now)
+    # check a proof and bill it under cost-v4 (linear networks for now)
     .lake/build/bin/compactcheck cost max2-v64-s0.json proof.json
 
     # check every input on its own

@@ -212,7 +212,7 @@ How the objects of Gross et al. appear here:
 | computational part $`C`$ | rules lane: the checker run on the proof file; open lane: the candidate's D |
 | argument $`Q`$ | rules lane: `checkProofFile_sound`; open lane: the candidate's soundness theorem |
 | trace of $`C(M)`$ | the checker's run; in the open lane the instance theorem, which the kernel evaluates |
-| length (FLOPs) | operations counted under our cost model, cost-v3 |
+| length (FLOPs) | operations counted under our cost model, cost-v4 |
 
 ### Count
 
@@ -265,7 +265,7 @@ Together they give the target `claimedCount ≤ numCorrect graph weights task`.
 ### Length
 
 Gross et al. measure a proof by the cost of running $`C`$ on the model. We count operations with our cost
-model, cost-v3 (the agent's `core/check/cost.py`, mirrored in Lean). A proof's length has three parts:
+model, cost-v4 (the agent's `core/check/cost.py`, mirrored in Lean). A proof's length has three parts:
 
 - **Reading the weights, $`E`$.** Every proof has to look at the network, so reading all of its weights costs
   one unit per parameter, once. That is why reading a weight inside D is free in the open lane: it is already
@@ -273,9 +273,13 @@ model, cost-v3 (the agent's `core/check/cost.py`, mirrored in Lean). A proof's l
 - **Computing with them.** What checking does with those numbers: one unit per arithmetic operation or
   comparison, 3 for an `exp`, so a whole forward pass costs its number of operations. In the open lane this is
   the bill.
-- **Reading the proof.** The numbers the proof itself contains. In the open lane that is the certificate, one
-  unit per number. In the rules lane it is the plan: one unit per number, string or boolean in the file, plus
-  one per node of the split tree.
+- **Reading the proof.** The numbers the proof supplies for the check to compute with, one unit each: in the
+  open lane the certificate, in the rules lane the entries of the approximations.
+
+The plan of a proof is not charged: in the open lane the code of D, in the rules lane the tree, the rule
+names and the flags of the proof file. Choosing what to check where is bookkeeping, not computing with the
+network's numbers, so it is capped in size instead (the description-size budget of D; a limit on the
+proof file's numbers, strings and tree nodes).
 
 **Open lane.** With $`\mathrm{cert}`$ the certificate (numbers the proof passes to D),
 
@@ -292,20 +296,19 @@ where the bill is the total charge of every operation D executes on the real wei
 | `selectV`, `bnot`, `band`, `bor` | 1 |
 | `exp` (an interval enclosing $`e^x`$) | 3 |
 | `charge`, with an amount $`k`$ | $`k`$ |
-| `single`, `gsingle` | one exact forward pass, as cost-v3 charges a single leaf |
-| `interval`, `ginterval`, `gtokenIntervals` | as cost-v3 charges the leaf |
+| `single`, `gsingle` | one exact forward pass, as the rules lane charges a single leaf |
+| `interval`, `ginterval`, `gtokenIntervals` | as the rules lane charges the leaf |
 
 The claimed bill is part of the instance theorem, so the kernel confirms it.
 
 **Rules lane.** $`L`$ is the sum of these terms:
 
 - $`E`$, for reading the weights;
-- read: the numbers, strings and booleans in the proof file;
-- tree: the number of nodes of the split tree;
+- read: the numbers of the approximations (every value, every entry of a low-rank factor, the start, end and
+  value of every segment);
 - single: the number of single leaves times $`c_{\mathrm{fwd}}`$, the cost of one exact forward pass;
 - interval: the sum of the interval charges of the leaves whose label is constant on the box;
-- contract, approximate: building the contracted maps and the approximations;
-- symmetry: the number of accepted leaves, when the rule is on.
+- contract, approximate: building the contracted maps and checking the approximations.
 
 On a linear network, $`c_{\mathrm{fwd}}`$ adds up, over the operations the output depends on: $`k \cdot out`$ for
 a linear map on the one-hot input (a lookup at each position), $`\mathrm{size}(s) \cdot out`$ for a linear map
@@ -314,23 +317,19 @@ dimension of size $`n`$, the size for an addition, and $`m - 1`$ for the final c
 with the same formulas as the agent's Python checker (for linear networks so far; on attention networks the
 charge of each rule is compared with Python's in tests).
 
-**Comparing the two lanes.** Computing is priced the same in both: the open lane's operations use the same
-functions as the rules lane's leaves (the open lane's `single` charges the rules lane's `singleCost`), and on
-attention networks tests compare each rule's charge with Python's. Reading the proof is priced differently:
-the rules lane pays for its plan, the open lane only for the certificate. The code of D is not charged; its
-size is capped instead (the description-size budget, [docs/COUNTED.md](docs/COUNTED.md)). So the same argument
-gets a different length in each lane, and lengths should be compared within a lane until the open lane
-charges for the size of D, which is planned for the next cost model.
+**Comparing the two lanes.** The same proof costs the same in both lanes: computing is priced by the same
+functions (the open lane's `single` charges the rules lane's `singleCost`), supplied numbers are read at one
+unit each, and neither lane charges its plan.
 
 **Example.** Brute force has one forward pass per input. On the tiny max-of-2 network ($`V = 8`$, $`k = 2`$,
 width 4, $`\lvert X \rvert = 64`$) a forward pass costs 2·4 for the embedding lookups, 4·4 and 4·8 for the
 two linear maps and 7 for the comparison, so $`c_{\mathrm{fwd}} = 63`$, and $`E = 80`$.
 
-- Open lane: $`L = 64 \cdot 63 + 80 = 4112`$.
-- Rules lane: the same 4,112, plus the plan: 73 tree nodes and 138 numbers and strings in the file, so
-  $`L = 4323`$.
+- Open lane: $`L = 64 \cdot 63 + 80 = 4112`$, with an empty certificate.
+- Rules lane: the same $`L = 4112`$; the split tree and its 64 rule names are the plan and cost nothing.
 
-Both certify all 64 inputs.
+Both certify all 64 inputs. (Until cost-v4 the rules lane also charged its plan, 73 tree nodes and 138
+numbers and strings, and gave 4,323.)
 
 ### In the code
 

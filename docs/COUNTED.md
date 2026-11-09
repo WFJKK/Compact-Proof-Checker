@@ -331,7 +331,9 @@ The mapping to `cost-v3`'s categories: `single`, `interval`, `gsingle` (billed a
 (billed as `interval`) and `gtokenIntervals` (billed as `token_interval` and `tables`) through the counted
 operations, `extract`
 and `read` as above, the arithmetic categories through the primitives. `tree` has no counterpart: the
-structure of a scored proof is its program, bounded by the literal budget below rather than charged.
+structure of a scored proof is its program, bounded by the literal budget below rather than charged. Since
+`cost-v4` (9 November 2026) the rules lane does not charge its plan either, so the same proof costs the
+same in both lanes; the prices of operations are `cost-v3`'s in both versions, so nothing here changed.
 
 ## General-layer safeguards
 
@@ -363,11 +365,14 @@ tests in `scripts/test_accept.py` say so in their names.
 
 ## Reproduction (`CountedCheck.lean`, `compactcheck cost`)
 
-`checkProofCounted` walks a split-tree proof file as `checkProof` does and bills it with `cost-v3`'s
-formulas, category by category: `extract`, `read`, `tree`, `single`, `interval`, `contract`,
-`approximate`, `symmetry`. The gate: on the four max2 baselines and every proof of the recorded max2 runs,
-the bill equals the Python length to the unit and the count equals the Python count
-(`scripts/test_cost.py`). Its soundness comes from the count being `checkProof`'s, which is proved sound.
+`checkProofCounted` walks a split-tree proof file as `checkProof` does and bills it with `cost-v4`'s
+formulas, category by category: `extract`, `read` (the numbers of the approximations), `single`,
+`interval`, `contract`, `approximate`. The plan (the tree, the rule names, the contraction chains, the
+symmetry flag) is free, as a checker's code is in the open lane; `cost-v3` also charged 1 per tree node,
+1 per number, string or boolean of the file and 1 per leaf certified under symmetry. The gate: on the four
+max2 baselines and every proof of the recorded max2 runs, the bill equals the Python length to the unit
+and the count equals the Python count (`scripts/test_cost.py`). Its soundness comes from the count being
+`checkProof`'s, which is proved sound.
 
 ## What stays open
 

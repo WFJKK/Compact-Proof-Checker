@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reproduction of cost-v3: `compactcheck cost` against the Python checker on proof files of real runs.
+"""Reproduction of cost-v4: `compactcheck cost` against the Python checker on proof files of real runs.
 
     python3 scripts/test_cost.py <pipeline repo> <run folder> [<run folder> ...] [--limit N] [--only TEXT] [--log FILE]
 

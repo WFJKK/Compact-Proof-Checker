@@ -219,7 +219,7 @@ COST_COMPARED = 0
 def check_both(check_proof, folder, nid: str, net: Path, tmp: Path, proof: dict) -> tuple[dict, dict]:
     """The Python checker's result and the Lean checker's last line, for one proof. When both accept the
     proof, `compactcheck cost` is run too and its bill compared with the Python length, category by category
-    (the reproduction of cost-v3, CountedCheck.lean); a difference is recorded in COST_MISMATCHES."""
+    (the reproduction of cost-v4, CountedCheck.lean); a difference is recorded in COST_MISMATCHES."""
     global COST_COMPARED
     py = check_proof(proof, folder, nid)
     (tmp / "proof.json").write_text(json.dumps(proof))
