@@ -1,8 +1,26 @@
 # Compact-Proof-Checker
 
-This repo checks compact proofs of model performance, in the sense of Gross et al.,
+This repo checks compact proofs about trained neural networks, and it checks them verifiably: when it
+accepts a proof, the claim it reports is backed by a theorem that Lean's kernel has checked. You don't have to
+trust whoever wrote the proof, or the code that checked it.
+
+What it does:
+
+1. **Input.** A trained network, exported exactly from PyTorch (its graph and its weights), and a proof about
+   it. The proof is either a plan in a fixed format (the rules lane) or Lean code (the open lane).
+2. **Check.** It rejects the proof with a reason, or accepts it with a certified count $`n`$: a proved lower
+   bound on the number of inputs the network answers correctly.
+3. **Measure.** It reports the proof's length: how many operations checking the proof costs.
+
+The aim is proofs that certify a lot with little work. Brute force runs the network on every input. A compact
+proof uses structure in the network to certify the same inputs with far fewer operations, and that is why
+short proofs tend to come with an understanding of how the network computes.
+
+### The formal setting
+
+We follow Gross et al.,
 [Compact Proofs of Model Performance via Mechanistic Interpretability](https://arxiv.org/abs/2406.11779)
-(2024). There, a model $`M`$ is evaluated on input-label pairs $`(l, t)`$ drawn from a distribution $`D`$, with a
+(2024). A model $`M`$ is evaluated on input-label pairs $`(l, t)`$ drawn from a distribution $`D`$, with a
 score $`f(l, M(t))`$, and the quantity of interest is the expected performance
 
 ```math
@@ -17,13 +35,18 @@ a number, and an argument $`Q`$ that this number is a lower bound for every mode
 ```
 
 Running $`C`$ on the actual weights gives the bound $`b = C(M)`$, and the length of the proof is the cost of
-that run. Brute force evaluates $`M`$ on every input. A compact proof uses structure in $`M`$ to get a good bound
-with much less work, and that is why short proofs tend to come with an understanding of how the model
-computes.
+that run.
 
-We use $`D`$ uniform over a finite input set $`X`$, and $`f = 1`$ when the label's logit is strictly the largest,
-$`0`$ otherwise, so $`\bar s`$ is the accuracy. You hand in a network and a proof; you get back whether the proof
-is valid, the bound it certifies (reported as a count $`n = b \cdot |X|`$) and its length.
+For now we only look at accuracy, as the paper does. $`D`$ is uniform over a finite input set $`X`$, and
+$`f`$ is 1 when the label's logit is strictly larger than every other logit and 0 otherwise (ties count as
+wrong). Then
+
+```math
+\bar s(M) = \frac{\mathrm{numCorrect}(M)}{\lvert X \rvert},
+```
+
+where $`\mathrm{numCorrect}(M)`$ is the number of inputs $`M`$ answers correctly. We report a bound as a count
+$`n = b \cdot \lvert X \rvert`$, so a proof certifies $`n \le \mathrm{numCorrect}(M)`$.
 
 The Lean library inside is called CompactCheck, and its command-line program `compactcheck`.
 
@@ -66,7 +89,7 @@ n ≤ numCorrect graph weights task
 `numCorrect` is defined in `CompactCheck/Spec.lean` over the real numbers. The meaning of every operation is
 written once for an arbitrary number type (`Eval.lean`, `Semantics.lean`) and used here with $`\mathbb{R}`$
 and the real exponential; `numCorrect` counts the inputs $`t \in X`$ where the label's logit is strictly
-larger than every other logit (ties count as wrong). It is $`|X| \cdot \bar s`$, and nothing ever evaluates it.
+larger than every other logit (ties count as wrong). It is $`\lvert X \rvert \cdot \bar s`$, and nothing ever evaluates it.
 Proofs bound it from below with exact computations (rational arithmetic, dyadic intervals, rational
 enclosures of `exp`) together with theorems that carry the computed facts over to $`\mathbb{R}`$.
 
@@ -203,7 +226,7 @@ Write $`\ell = M_w(t) \in \mathbb{R}^m`$ for the logits on input $`t`$ and $`\la
 \mathrm{numCorrect} = \lvert \{ t \in X : \mathrm{Correct}(t) \} \rvert.
 ```
 
-Every accepted proof gives a count $`n`$ with $`n \le \mathrm{numCorrect}`$, that is a bound $`b = n / |X|`$ on
+Every accepted proof gives a count $`n`$ with $`n \le \mathrm{numCorrect}`$, that is a bound $`b = n / \lvert X \rvert`$ on
 the accuracy.
 
 **Rules lane.** The proof file's tree is walked into leaves $`(B_1, r_1), \dots, (B_K, r_K)`$: each $`B_i`$ is a
@@ -211,13 +234,13 @@ box, a range of tokens $`[lo_p, hi_p]`$ at each position $`p`$, with its rule $`
 exactly one box (`walk_partition`). With
 
 ```math
-|B| = \prod_p (hi_p - lo_p + 1),
+\lvert B \rvert = \prod_p (hi_p - lo_p + 1),
 ```
 
 the count is the size of the boxes whose rule succeeds:
 
 ```math
-n = \sum_{i \,:\, r_i \text{ accepts } B_i} |B_i|.
+n = \sum_{i \,:\, r_i \text{ accepts } B_i} \lvert B_i \rvert.
 ```
 
 With the symmetry rule, $`n`$ counts the inputs whose sorted version lies in an accepted box.
@@ -241,15 +264,23 @@ Together they give the target `claimedCount ≤ numCorrect graph weights task`.
 
 ### Length
 
-Gross et al. measure a proof by the cost of running $`C`$ on the model. We count operations under cost-v3 (the
-agent's `core/check/cost.py`, mirrored in Lean): one unit per arithmetic operation or comparison on a number
-of the network, $`E`$ (the number of parameters) for reading the weights once, and one unit per number the
-proof hands over.
+Gross et al. measure a proof by the cost of running $`C`$ on the model. We count operations with our cost
+model, cost-v3 (the agent's `core/check/cost.py`, mirrored in Lean). A proof's length has three parts:
+
+- **Reading the weights, $`E`$.** Every proof has to look at the network, so reading all of its weights costs
+  one unit per parameter, once. That is why reading a weight inside D is free in the open lane: it is already
+  paid for.
+- **Computing with them.** What checking does with those numbers: one unit per arithmetic operation or
+  comparison, 3 for an `exp`, so a whole forward pass costs its number of operations. In the open lane this is
+  the bill.
+- **Reading the proof.** The numbers the proof itself contains. In the open lane that is the certificate, one
+  unit per number. In the rules lane it is the plan: one unit per number, string or boolean in the file, plus
+  one per node of the split tree.
 
 **Open lane.** With $`\mathrm{cert}`$ the certificate (numbers the proof passes to D),
 
 ```math
-L = \mathrm{bill} + E + |\mathrm{cert}|,
+L = \mathrm{bill} + E + \lvert \mathrm{cert} \rvert,
 ```
 
 where the bill is the total charge of every operation D executes on the real weights:
@@ -283,15 +314,23 @@ dimension of size $`n`$, the size for an addition, and $`m - 1`$ for the final c
 with the same formulas as the agent's Python checker (for linear networks so far; on attention networks the
 charge of each rule is compared with Python's in tests).
 
-**Example.** Brute force has one forward pass per input, so in the open lane
+**Comparing the two lanes.** Computing is priced the same in both: the open lane's operations use the same
+functions as the rules lane's leaves (the open lane's `single` charges the rules lane's `singleCost`), and on
+attention networks tests compare each rule's charge with Python's. Reading the proof is priced differently:
+the rules lane pays for its plan, the open lane only for the certificate. The code of D is not charged; its
+size is capped instead (the description-size budget, [docs/COUNTED.md](docs/COUNTED.md)). So the same argument
+gets a different length in each lane, and lengths should be compared within a lane until the open lane
+charges for the size of D, which is planned for the next cost model.
 
-```math
-L = |X| \cdot c_{\mathrm{fwd}} + E.
-```
+**Example.** Brute force has one forward pass per input. On the tiny max-of-2 network ($`V = 8`$, $`k = 2`$,
+width 4, $`\lvert X \rvert = 64`$) a forward pass costs 2·4 for the embedding lookups, 4·4 and 4·8 for the
+two linear maps and 7 for the comparison, so $`c_{\mathrm{fwd}} = 63`$, and $`E = 80`$.
 
-On the tiny max-of-2 network ($`V = 8`$, $`k = 2`$, width 4, $`|X| = 64`$) a forward pass costs 2·4 for the
-embedding lookups, 4·4 and 4·8 for the two linear maps and 7 for the comparison, so $`c_{\mathrm{fwd}} = 63`$.
-With $`E = 80`$ that gives $`L = 64 \cdot 63 + 80 = 4112`$, with count 64.
+- Open lane: $`L = 64 \cdot 63 + 80 = 4112`$.
+- Rules lane: the same 4,112, plus the plan: 73 tree nodes and 138 numbers and strings in the file, so
+  $`L = 4323`$.
+
+Both certify all 64 inputs.
 
 ### In the code
 
