@@ -29,7 +29,15 @@ PORT = PROJECT / "examples" / "open_lane" / "max2_tiny_cols23_v3"
 TREE = PROJECT / "examples" / "open_lane" / "max2_tiny_decision_tree"
 ATTN = PROJECT / "examples" / "open_lane" / "attn_max2_tiny_scored"
 ATTN_TOKENS = PROJECT / "examples" / "open_lane" / "attn_max2_tiny_tokens"
-REPO = Path(os.environ.get("COMPACT_PROOF_REPO", PROJECT.parent / "auto-research-compact-proof"))
+def _agent_repo() -> Path:
+    """The agent repository next to this one: Compact-Proof-Agent, or a clone made under its old name."""
+    for name in ("Compact-Proof-Agent", "auto-research-compact-proof", "Auto-Research-Compact-Proof"):
+        if (PROJECT.parent / name / "core").is_dir():
+            return PROJECT.parent / name
+    return PROJECT.parent / "Compact-Proof-Agent"
+
+
+REPO = Path(os.environ.get("COMPACT_PROOF_REPO") or _agent_repo())
 
 pytestmark = pytest.mark.skipif(not (REPO / "core").is_dir(), reason="the pipeline repository is not next to this one")
 

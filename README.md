@@ -1,230 +1,191 @@
-# CompactCheck
+# Compact-Proof-Checker
 
-A verified checker, in Lean 4, for the compact proofs of the
-Auto-Research-Compact-Proof pipeline.
+This repo checks compact proofs about small neural networks. A compact proof shows that a trained network
+gets at least n of its inputs right, with less work than running the network on every input. You give it a
+network and a proof, and it tells you whether the proof is correct, how many inputs it certifies and how
+long it is.
 
-## What is proved
+A tiny example. Take a network that reads two tokens, each 0 or 1, and should output the larger one. Brute
+force runs it on all four inputs: 12 arithmetic operations. A smarter proof notices that only the
+difference between the two output scores matters, and checks two inequalities instead: 6 operations. Both
+prove the same thing; the second one is more compact. On bigger networks the gap grows with the number of
+inputs. Short proofs usually come from understanding how the network computes, which is why we care about
+them.
 
-`checkProofFile_sound` in `CompactCheck/FileSound.lean`: for every network
-file and every proof file, if the checker certifies `n` inputs, then the
-network answers at least `n` inputs correctly.
+The Lean library inside is called CompactCheck, and its command-line program `compactcheck`.
 
-"Correctly" is defined in `CompactCheck/Spec.lean`, over the real numbers,
-with the real exponential. The proof uses only Lean's standard axioms
-(`propext`, `Classical.choice`, `Quot.sound`); `#print axioms
-checkProofFile_sound` shows them.
+## What it works for
 
-The checker checks each network the way the Python checker does:
+A network is data here, not code: a list of operations plus its exact weights, exported from PyTorch by
+`scripts/export_network.py`. Any network built from these operations works, at any size:
 
-- Linear networks (`input`, `linear`, `sum`, `add`) with `checkProof`, and
-  every rule of the Python checker for them: `single`, `skip` and
-  `interval` leaves, and the `contract`, `symmetry` and `approximate`
-  rules. The theorem for these is `check_sound` in `Soundness.lean`.
-- Attention networks and the xorformer (`core/check/general.py`) with
-  `checkProofGeneral`: `single`, `skip`, `interval` and `token_interval`
-  leaves. The theorem for these is `checkGeneral_sound` in
-  `TokensLeafSound.lean`.
+- linear layers, sums and additions
+- matrix products, and entrywise addition, subtraction, multiplication and negation
+- indexing and reshaping (index, transpose, unsqueeze, expand, cat, stack)
+- `exp` and `softmax`
 
-A proof with a rule adopted through the rule route (such as
-`token_convex`) is rejected for now, so every count the checker gives is
-backed by the theorem.
+That covers linear models and attention-only transformers, and our xorformer. MLPs with ReLU or GELU, and
+LayerNorm, are not in yet. Inputs are short token sequences over a small vocabulary, and the tasks are max,
+min and majority.
 
-An `interval` leaf certifies every input of its box at once.
-`intervalLeaf_sound` in `IntervalSound.lean` proves that every input of an
-accepted box passes the single test. It uses the same bounds as the Python
-checker, which are exact when the output map sees the summed one-hot input
-directly (after a full contraction) and all positions but one hold a single
-token.
+## Where Lean comes in
 
-A `contract` entry replaces a chain of linear maps by their product,
-computed exactly. `contractAll_sound` in `ContractSound.lean` proves that
-whatever the contracted network outputs, the original network outputs too,
-so the leaves can be checked on the contracted network.
+Everything that decides whether a proof is correct is written in Lean 4 (4.35.0-rc4, with Mathlib). What it
+means for the network to answer an input correctly is defined once, in `CompactCheck/Spec.lean`: run the
+network's graph in exact real arithmetic, with the real exponential, and check that the right answer gets
+strictly the highest score. `numCorrect` counts the inputs where this holds. Nobody computes it; proofs show
+lower bounds on it.
 
-With `"symmetry": true`, a certified leaf counts its inputs in sorted order
-and all their reorderings. The rule needs a network that reads its input
-only through a sum over the positions, and a task whose label does not
-depend on the order; each task in `Task.lean` says whether it is, with a
-proof. `evalGraph_perm` in `SymmetrySound.lean` proves that such a network
-computes the same output on every reordering of an input.
+Every verdict of this repo is a theorem about `numCorrect`, checked by Lean's kernel and using only Lean's
+standard axioms. So you don't have to trust the code that checks proofs, only the definition and the script
+that exports the network.
 
-An `approximate` entry gives a simpler matrix `P` for a linear map with
-weight `W` (dense, low rank, or constant on row segments). The checker
-computes `eps = max |W - P|` exactly, and interval leaves that name the
-approximation bound the differences `W[l, t] - W[j, t]` by those of `P`
-minus `2 eps` (`approxTerm_le` in `IntervalSound.lean`). Numbers in proof
-files are read as the Python checker reads them (`parseNumber` in
-`Json.lean`).
+## Related repos
 
-## Attention networks
+- [Compact-Proof-Library](https://github.com/WFJKK/Compact-Proof-Library): where we collect compact proofs
+  written by hand, for example Gross et al.'s proofs for max-of-k. Each one is checked here.
+- [Compact-Proof-Agent](https://github.com/WFJKK/Compact-Proof-Agent): our agent, which searches for compact
+  proofs on its own and uses this checker to verify them. It pins the commit of this repo it expects in its
+  `lean-checker.lock`.
 
-Every value is a tensor of intervals, stored as Python's interval tensors
-store them (`IT` in `core/check/interval.py`): integers with one power of
-two per tensor. Sums, differences and products are exact, so every bound
-has the value Python's has and both checkers accept the same leaves. `exp`
-and `softmax` use the bounds of `Exp.lean`, as `core/check/interval.py`
-computes them: a Taylor series after halving the argument, rounded
-outwards at 2^-120, then squared back.
+## Two ways to hand in a proof
 
-A `single` leaf runs the network on its one input. An `interval` leaf runs
-it on all inputs of its box at once: the one-hot input may only be
-multiplied by a weight matrix, which gives at each position the smallest
-and largest entry of each column over the allowed tokens. Either leaf
-certifies its inputs if the lower bound of the label's logit is above the
-upper bound of every other logit.
+There are two lanes. In both, a proof proves the same kind of statement: the network answers at least n
+inputs correctly, as defined in `Spec.lean`. They differ in what a proof is made of. In the diagrams, purple
+is written by whoever hands in the proof (our agent or a person), green is checked in Lean, and grey is fixed
+code and data.
 
-`ExpSound.lean` proves the bounds on `exp` and `softmax`.
-`GeneralOpsSound.lean` proves that each operation keeps every true value
-inside its interval, and `GeneralSound.lean` puts the operations together
-for single and interval leaves. The contract, symmetry and approximate
-rules need a linear network; on these networks the Python checker refuses
-them, and so does this one.
+### The rules lane
 
-## token_interval leaves
+A proof is a JSON file: a plan that splits the inputs into boxes and names a rule for each box. `single` runs
+the network exactly on one input, `interval` bounds its outputs over a whole box at once, `token_interval`
+does the same while keeping each token's contribution apart, and `skip` gives up on a box. Linear networks
+also have `contract`, `symmetry` and `approximate`. The rules are fixed: each one is implemented in Lean and
+proved correct once (`checkProofFile_sound`), so a proof file only chooses which rule goes where.
 
-`Tokens.lean` checks a `token_interval` leaf as `core/check/tokens.py`
-does. An interval leaf turns each position's tokens into one box at the
-first lookup. A token_interval leaf keeps the tokens apart for as long as
-the graph allows: the rows of a weight matrix for each allowed token at
-each position, weighted sums of such rows, and, when at most one position
-varies, one value per input of the box. An operation outside these rules
-turns its arguments into interval tensors, as Python does. The leaf
-certifies its box if the lowest margin bound over its inputs is positive.
+```mermaid
+flowchart TD
+    net["Network file (JSON)<br/>from export_network.py"]
+    proof["Proof file (JSON)<br/>boxes, a rule for each"]
+    py["Python checker<br/>in the agent, fast"]
+    lean["Lean checker<br/>proved sound"]
+    out["Count n and length L"]
+    net --> py
+    net --> lean
+    proof --> py
+    proof --> lean
+    py --> out
+    lean --> out
+    classDef byauthor fill:#EEEDFE,stroke:#534AB7,color:#26215C
+    classDef inlean fill:#E1F5EE,stroke:#0F6E56,color:#04342C
+    classDef fixed fill:#F1EFE8,stroke:#888780,color:#2C2C2A
+    class proof byauthor
+    class lean inlean
+    class net,py,out fixed
+```
 
-Lean computes the same margin bounds as Python, as exact fractions:
-`scripts/compare_tokens.py` compares them box by box (175,102 random boxes
-on the 60 development networks, all equal).
+The agent writes proof files with Python recipes. Its Python checker reads them during a run and gives the
+numbers fast; the Lean checker (`compactcheck`) reads the same files and gives the same numbers with a theorem behind them. If
+the two ever disagree, believe Lean. (The agent's code still calls this the legacy lane.) All the rules in
+detail: [docs/RULES.md](docs/RULES.md).
 
-In a few edge cases Lean does not follow Python's rules:
+### The open lane
 
-- A product of rows with a constant whose intervals agree along a
-  dimension, but whose real values may differ there. Python treats it as
-  one weight per position, which can give a wrong bound. Lean declines
-  that rule, as Python declines any other inexact constant.
-- Rules that rely on a shape Python does not check. Lean checks the shape
-  and declines otherwise.
+A proof is Lean code. Whoever writes it brings their own checker for their own argument: a small program D
+that takes the weights and returns how many inputs it can vouch for, together with two theorems. The first
+says that for any weights, the number D returns is at most the number of inputs the network gets right. The
+second says that on this network's weights, D returns n; the kernel actually runs D to check it. Together they
+prove the statement. This lane is for arguments the rules can't express.
 
-None of these cases occurs on the networks of the zoo, so both checkers
-certify the same inputs there.
+The statement itself comes from the service, not from the proof. `scripts/accept.py` writes a protected module
+with the network's graph, its exact weights and the target `claimedCount ≤ numCorrect graph weights task`, and
+the kernel has to accept the submitted proof (we call a submission a candidate) of exactly that. The candidate
+is compiled in a sandbox, and every definition and theorem in it is re-checked by the kernel from scratch.
 
-The proof fixes an input of the box and relates every value of the leaf to
-the real value on that input (`TokensSepSound.lean`,
-`TokensMixSound.lean`, `TokensLeaveSound.lean`). Every operation keeps the
-relation (`TokensSound.lean`), and the margin bound is below the real
-margin (`lowestMargin_sound` in `TokensLeafSound.lean`).
+```mermaid
+flowchart TD
+    net["Network file (JSON)<br/>from export_network.py"] --> gen["make_protected.py<br/>writes it as Lean data"]
+    gen --> prot["Protected module<br/>graph, weights, target"]
+    author["Agent or person<br/>writes Lean, no JSON"] --> cand["Candidate .lean file<br/>a checker D plus proofs"]
+    cand --> kernel["Lean kernel<br/>checks the proofs, runs D"]
+    prot --> kernel
+    kernel --> receipt["Receipt<br/>count n, length L"]
+    classDef byauthor fill:#EEEDFE,stroke:#534AB7,color:#26215C
+    classDef inlean fill:#E1F5EE,stroke:#0F6E56,color:#04342C
+    classDef fixed fill:#F1EFE8,stroke:#888780,color:#2C2C2A
+    class author,cand byauthor
+    class kernel inlean
+    class net,gen,prot,receipt fixed
+```
 
-## The open lane
+To get a length as well as a count, D has to be written in a small counted language
+(`CompactCheck/CountedOps.lean`). Every operation on a number of the network goes through an interpreter that
+charges for it, and D can't branch on what it learns, so the bill is the whole cost of the check. Details:
+[docs/OPEN_LANE.md](docs/OPEN_LANE.md) and [docs/COUNTED.md](docs/COUNTED.md).
 
-Proofs that are not proof files: Lean modules that prove a protected
-target, checked by the kernel, and a counted language that gives such a
-proof a length. `docs/OPEN_LANE.md` describes the acceptance service and
-`docs/COUNTED.md` the counted language.
+| | Rules lane | Open lane |
+| --- | --- | --- |
+| A proof is | a JSON plan: boxes and a rule for each | Lean code: a checker D plus proofs |
+| The reasoning comes from | rules written and proved once, here | whoever writes the proof |
+| Checked by | the Lean checker (and the agent's Python checker) | the Lean kernel |
+| Can express | what the rules allow | any argument you can prove in Lean |
 
-## Files
+## What the numbers mean
 
-| File | What it is |
-| --- | --- |
-| `Spec.lean` | the spec: what the network computes over the reals, `Correct`, `numCorrect` |
-| `Eval.lean` | what each operation of linear networks computes, written once for any number type |
-| `Semantics.lean` | what the operations of attention networks compute, also for any number type |
-| `Network.lean` | networks as graphs of operations, with named weights |
-| `Task.lean` | tasks: the input space, the correct label (max, min), and a proved test for boxes with one label |
-| `Tensor.lean` | tensors: a shape and its entries in row-major order |
-| `Walk.lean` | split trees, the walk, and `walk_partition` |
-| `LinAlg.lean` | vectors and matrices over the rationals |
-| `Interval.lean` | the interval rule: bounds over a box of inputs, with or without an approximation |
-| `Contract.lean` | the contract rule: products of linear maps |
-| `Approx.lean` | the approximate rule: checking an approximation and its error |
-| `Symmetry.lean` | the symmetry rule: the test on the network, and the count |
-| `Check.lean` | the checker on linear networks: contractions, approximations, then the leaves |
-| `Exp.lean` | bounds on `exp` and `softmax`, as the Python checker computes them |
-| `General.lean` | the checker on attention networks: interval tensors of dyadic numbers |
-| `IntervalSound.lean` | `intervalLeaf_sound` and the lemmas it rests on |
-| `ContractSound.lean` | `contractAll_sound` and the lemmas it rests on |
-| `SymmetrySound.lean` | `evalGraph_perm` and the lemmas it rests on |
-| `Soundness.lean` | `check_sound` and the lemmas it rests on |
-| `ExpSound.lean` | the bounds of `Exp.lean` hold |
-| `GeneralOpsSound.lean` | each operation of `General.lean` keeps the true values inside its intervals |
-| `GeneralSound.lean` | single and interval leaves of attention networks are sound |
-| `Tokens.lean` | the token_interval leaves, as `core/check/tokens.py` computes them |
-| `TokensIndex.lean` | facts about shapes and indices for the token rules |
-| `TokensSepSound.lean` | the relation between a leaf's values and the real values; rows per position |
-| `TokensMixSound.lean` | weighted sums of rows |
-| `TokensLeaveSound.lean` | values that leave the domain: one per input, or interval tensors |
-| `TokensSound.lean` | every operation of a token_interval leaf keeps the relation |
-| `TokensLeafSound.lean` | the margin bound, the leaf, and `checkGeneral_sound` |
-| `FileSound.lean` | `checkProofFile_sound`: both checkers, as the program runs them |
-| `Counted.lean` | the counted language of the open lane: a monad whose every operation on a number is charged |
-| `CountedCheck.lean` | the checker with its bill: `cost-v3` for proof files (`compactcheck cost`) |
-| `CountedOps.lean` | the checker's rules as charged operations, each with its specification |
-| `CountedGeneral.lean`, `CountedGeneralSound.lean` | the single and interval rules on attention networks as counted operations (`gsingle`; `ginterval`, maximum-knowledge condition only), and the soundness of the token_interval operation |
-| `TokensCost.lean` | the token_interval rule priced as `cost-v3` prices it (its rows kept once per call), as the counted operation `gtokenIntervals` (maximum-knowledge condition only) |
-| `../AcceptMain.lean` | the `acceptcheck` program: the open lane's trusted check |
-| `Json.lean`, `../Main.lean` | reading files, and the `compactcheck` program |
-| `*Test.lean` | tests; the build fails if one fails |
-| `Tutorial.lean` | Lean basics, with exercises |
+- **Count**: how many inputs the proof certifies. It is always a lower bound on `numCorrect`. In the rules lane
+  the checker adds up the sizes of the boxes whose rule succeeds. In the open lane it is the claim in the
+  target, which the proof has to establish.
+- **Length**: how much work checking the proof costs, in the units of our cost model (cost-v3): roughly one per
+  arithmetic operation, plus one per weight read and one per number the proof hands over. In the rules lane
+  Lean computes it with the same formulas as the agent's Python checker (for linear networks so far; on
+  attention networks the charge of each rule is compared with Python's in tests). In the open lane it is the
+  bill of D on the real weights, plus the number of weights, plus the numbers in the certificate, and the
+  kernel confirms the bill.
+
+For example, brute force on the tiny max-of-2 network (2 positions, 8 tokens, 64 inputs) runs the network 64
+times at 63 operations each and reads 80 weights: count 64, length 4,112.
 
 ## What has to be trusted
 
-- `Spec.lean`, `Eval.lean`, `Semantics.lean`, `Network.lean`, and in
-  `Task.lean` the input spaces and labels: they say what "correct" means. A task's test for boxes
-  with one label, and whether its label depends on the order of the tokens,
-  come with proofs and need no trust.
-- `scripts/export_network.py`: it writes down the graph PyTorch traces,
-  with the names proof files use for its operations, and the exact
-  weights. `scripts/compare_with_python.py` (linear networks) and
-  `scripts/compare_floats.py` (any network, in float64) check the result
-  against PyTorch, and `compare_with_python.py` and `compare_general.py`
-  against the Python checker.
-- For the `compactcheck` program: the Lean compiler and the JSON reader.
-  The theorems themselves are checked by Lean's kernel.
+- `CompactCheck/Spec.lean` and the files it rests on (`Eval.lean`, `Semantics.lean`, `Network.lean`, and the
+  input spaces and labels in `Task.lean`): they say what correct means.
+- `scripts/export_network.py`, which writes down the network PyTorch traces, with its exact weights.
+  `scripts/compare_floats.py` checks Lean's semantics against PyTorch on every development network.
+- For the open lane, also `scripts/make_protected.py` with the check of its output, `AcceptMain.lean`, and
+  `scripts/accept.py` with its sandbox.
+- The Lean toolchain.
 
-`Check.lean`, `Interval.lean`, `Contract.lean`, `Approx.lean`,
-`Symmetry.lean`, `General.lean`, `Tokens.lean`, `Exp.lean`, `Walk.lean` and
-`LinAlg.lean` need no trust: the theorem is about them. Nor does the network file's flag
-that says which checker to use: both are sound. Nor does reading the numbers of an approximation: whatever
-matrix the reader produces, its error is computed from it.
+The checkers themselves need no trust: the theorems are about them.
 
-## Build
+## Build and use
 
     lake build                  # library, proofs and tests
-    lake build compactcheck     # the program
-    lake build acceptcheck      # the open lane's service (docs/OPEN_LANE.md)
+    lake build compactcheck     # the command-line program
+    lake build acceptcheck      # the open lane's service
 
-## Use
-
-The scripts need the pipeline's Python environment (numpy, torch).
-
-    # export a network of the pipeline
-    python3 scripts/export_network.py <repo> models/max2 max2-v64-s0 max2-v64-s0.json
+    # export a network of the agent's zoo
+    python3 scripts/export_network.py <agent repo> models/max2 max2-v64-s0 max2-v64-s0.json
 
     # check a proof file; the last line is {"certified": n}
     .lake/build/bin/compactcheck max2-v64-s0.json proof.json
 
-    # check a proof and bill it under cost-v3 (linear networks for now)
-    .lake/build/bin/compactcheck cost max2-v64-s0.json proof.json
+    # submit an open-lane candidate (a folder with manifest.json and Candidate/*.lean)
+    python3 scripts/accept.py submit <candidate> --repo <agent repo> --work <work dir>
 
-    # check every input on its own
-    .lake/build/bin/compactcheck brute max2-v64-s0.json
+    # tests of the service (the agent repo next to this one, or COMPACT_PROOF_REPO)
+    python3 -m pytest scripts/test_accept.py
 
-    # compare with the Python pipeline on every development network
-    python3 scripts/compare_with_python.py <repo> models/max2
+The scripts need the agent's Python environment (numpy, torch). More commands are in
+[docs/RULES.md](docs/RULES.md).
 
-    # the same for an attention model or the xorformer, leaf by leaf;
-    # resumes from the log if interrupted
-    python3 scripts/compare_general.py <repo> models/attn-max2 --log attn-max2.jsonl
+## What's where
 
-    # the open lane's single and interval rules on an attention network: verdict and cost-v3 charge
-    .lake/build/bin/compactcheck gsingle attn-max2-v64-s0.json inputs.json
-    .lake/build/bin/compactcheck ginterval attn-max2-v64-s0.json boxes.json
-    .lake/build/bin/compactcheck gtokens attn-max2-v64-s0.json boxes.json
-
-    # token_interval margin bounds against Python's, box by box
-    python3 scripts/compare_tokens.py <repo> models/attn-max2 --log tokens-attn-max2.jsonl
-
-    # Lean's semantics in float64 against PyTorch, on every development network
-    python3 scripts/compare_floats.py <repo> models/attn-max2
-
-    # check every proof of a pipeline run (development networks) against
-    # the counts the Python checker recorded; resumes if interrupted
-    python3 scripts/check_run.py <repo> ~/auto-research-compact-proof-runs/<run id>
+| Path | What it is |
+| --- | --- |
+| `CompactCheck/` | the Lean library: the spec, both checkers and their proofs, the counted language |
+| `AcceptMain.lean` | `acceptcheck`, the open lane's trusted check |
+| `Main.lean` | `compactcheck`, the command-line program |
+| `scripts/` | the exporter, the open-lane service, comparisons with Python, tests |
+| `accept/` | the allowlists of the counted language |
+| `examples/open_lane/` | open-lane candidates, from brute force to the agent's proofs |
+| `docs/` | the details: [RULES.md](docs/RULES.md), [OPEN_LANE.md](docs/OPEN_LANE.md), [COUNTED.md](docs/COUNTED.md) |
