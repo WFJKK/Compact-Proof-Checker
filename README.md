@@ -156,8 +156,8 @@ flowchart TD
 
 The agent writes proof files with Python recipes. Its Python checker reads them during a run and gives the
 numbers fast; the Lean checker (`compactcheck`) reads the same files and gives the same numbers with a
-theorem behind them. If the two ever disagree, believe Lean. (The agent's code still calls this the legacy
-lane.) All the rules in detail: [docs/RULES.md](docs/RULES.md).
+theorem behind them. If the two ever disagree, believe Lean. All the rules in detail:
+[docs/RULES.md](docs/RULES.md).
 
 ### The open lane
 
@@ -328,8 +328,7 @@ two linear maps and 7 for the comparison, so $`c_{\mathrm{fwd}} = 63`$, and $`E 
 - Open lane: $`L = 64 \cdot 63 + 80 = 4112`$, with an empty certificate.
 - Rules lane: the same $`L = 4112`$; the split tree and its 64 rule names are the plan and cost nothing.
 
-Both certify all 64 inputs. (Until cost-v4 the rules lane also charged its plan, 73 tree nodes and 138
-numbers and strings, and gave 4,323.)
+Both certify all 64 inputs.
 
 ### In the code
 
