@@ -164,6 +164,36 @@ def test_redeclaring_a_trusted_constant_is_rejected(work, tmp_path):
     assert r["status"] == "accepted", r["reason"]
 
 
+def _with_module(tmp_path: Path, name: str, rel: str, text: str) -> Path:
+    """A copy of the example with one more module, compiled and replayed but not imported by the proof."""
+    d = variant(tmp_path, name)
+    (d / rel).write_text(text)
+    m = json.loads((d / "manifest.json").read_text())
+    m["modules"] = [rel] + m["modules"]
+    (d / "manifest.json").write_text(json.dumps(m))
+    return d
+
+
+def test_a_copy_of_a_trusted_equation_lemma_is_accepted(work, tmp_path):
+    """Lean generates `Tensor.get.eq_1` in whichever module first unfolds `Tensor.get`; trusted modules already
+    have it, and a candidate module that unfolds it without importing one of them has its own, identical copy
+    (run attn-min2-ptl-1, 12 November 2026, round 3 was refused for this). The copy is left out of the replay."""
+    extra = ("import CompactCheck.Tensor\n\nnamespace Candidate.Extra\nopen CompactCheck\n\n"
+             "theorem get_eq (t : Tensor Nat) (i : Nat) : t.get i = t.data.getD i 0 := by\n  simp [Tensor.get]\n\n"
+             "end Candidate.Extra\n")
+    r = submit(_with_module(tmp_path, "eq-lemma-copy", "Candidate/Extra.lean", extra), work)
+    assert r["status"] == "accepted", r["reason"]
+    assert r["certified_count"] == 64
+
+
+def test_a_trusted_name_with_another_statement_is_rejected(work, tmp_path):
+    """Only an identical theorem passes: a module that does not import `singleOk_correct` can declare that name
+    with any statement, and the service refuses it."""
+    fake = ("import CompactCheck.Tensor\n\ntheorem CompactCheck.singleOk_correct : True := trivial\n")
+    r = submit(_with_module(tmp_path, "trusted-name", "Candidate/Fake.lean", fake), work)
+    assert r["status"] == "rejected" and "redeclares CompactCheck.singleOk_correct" in r["reason"], r["reason"]
+
+
 def test_a_macro_cannot_change_the_challenge(work, tmp_path):
     hijack = (
         "\nopen Lean Elab Command in\n"

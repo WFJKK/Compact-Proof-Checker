@@ -99,6 +99,18 @@ def oleanConstants (path : System.FilePath) : IO (Array ConstantInfo) := do
   let (data, _region) ← readModuleData path
   return data.constants
 
+/-- A candidate constant that the trusted modules already have, identically: a theorem with the same universe
+    parameters and the same statement. Lean generates some theorems on demand, in whichever module first needs
+    them: the equation lemmas `f.eq_1`, `f.eq_def` of a definition that a proof unfolds (`simp [f]`, `unfold f`,
+    `rw [f]`). A candidate module that unfolds a trusted definition without importing a trusted module that
+    already generated them carries its own copy. The copy changes nothing: the trusted one is kernel-checked and
+    states the same, and the candidate's constants refer to it by name. It is left out of the replay; any other
+    constant with a trusted name is still refused. -/
+def sameTrustedTheorem (kenv : Kernel.Environment) (ci : ConstantInfo) : Bool :=
+  match kenv.find? ci.name, ci with
+  | some (.thmInfo t), .thmInfo c => t.levelParams == c.levelParams && t.type == c.type
+  | _, _ => false
+
 def runCheck (target cand : Name) (trusted : List Name) (oleans : List String) : IO UInt32 := do
   initSearchPath (← findSysroot)
   let imports := trusted.toArray.map fun m => { module := m : Import }
@@ -112,6 +124,7 @@ def runCheck (target cand : Name) (trusted : List Name) (oleans : List String) :
   for path in oleans do
     for ci in ← oleanConstants path do
       if (kenv.find? ci.name).isSome then
+        if sameTrustedTheorem kenv ci then continue
         return ← rejected s!"the candidate redeclares {ci.name}, a constant of the trusted modules"
       if ci.name.getRoot == `Challenge then
         return ← rejected s!"the candidate declares {ci.name}; the Challenge namespace is the service's"
@@ -172,14 +185,16 @@ def instanceType (D weights cert : Name) (n bill : Nat) : Expr :=
     (mkApp3 (mkConst ``CompactCheck.CostM.billed) natT (counted D) (envE (mkConst weights) (mkConst cert)))
     (someE (prodT natT natT) (pairE natT natT (mkNatLit n) (mkNatLit bill)))
 
-/-- The candidate's constants, by name: `none` with a reason if one is a trusted constant's name, is in
-    the `Challenge` namespace, or is declared twice. -/
+/-- The candidate's constants, by name: `none` with a reason if one is a trusted constant's name (other than an
+    identical copy of a trusted theorem, `sameTrustedTheorem`, which is left out), is in the `Challenge`
+    namespace, or is declared twice. -/
 def candidateConstants (kenv : Kernel.Environment) (oleans : List String) :
     IO (Except String (Std.HashMap Name ConstantInfo)) := do
   let mut cs : Std.HashMap Name ConstantInfo := {}
   for path in oleans do
     for ci in ← oleanConstants path do
       if (kenv.find? ci.name).isSome then
+        if sameTrustedTheorem kenv ci then continue
         return .error s!"the candidate redeclares {ci.name}, a constant of the trusted modules"
       if ci.name.getRoot == `Challenge then
         return .error s!"the candidate declares {ci.name}; the Challenge namespace is the service's"

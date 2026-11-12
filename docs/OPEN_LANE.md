@@ -42,7 +42,11 @@ of inputs the network answers correctly over the reals, ties counting as wrong.
 4. Runs `acceptcheck check` in the box: it imports the trusted modules only, replays every constant of the
    candidate's `.olean` files through the kernel (`Lean.Kernel.Environment.replay`, as lean4checker does),
    and asks the kernel to accept `Challenge.proof : Target := <theorem>`. No candidate source is elaborated
-   by the service's own tool, so a macro or notation in a candidate module changes nothing.
+   by the service's own tool, so a macro or notation in a candidate module changes nothing. A candidate
+   constant with a trusted constant's name is refused, except an identical copy of a trusted theorem (same
+   statement and universe parameters), which is left out of the replay: Lean generates equation lemmas such
+   as `Tensor.get.eq_1` in whichever module first unfolds the definition, so a candidate module can carry
+   its own copy of one the trusted modules already have.
 5. Allows only the axioms `propext`, `Classical.choice` and `Quot.sound`. `sorryAx` and `Lean.ofReduceBool`
    (`native_decide`) are rejected.
 
