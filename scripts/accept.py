@@ -20,7 +20,9 @@ What happens, in order (every step's outcome is in the receipt):
    `acceptcheck protected` checks its constants against the network file with the checker's own reader.
 3. Each candidate module is compiled with `lean` in a box (Landlock on Linux: no network, reads only the
    toolchain, the Lean project, the workspace and system files, writes only the workspace's out/ and tmp/;
-   `process` mode elsewhere, which is weak and is recorded as such), under time and memory limits.
+   on macOS with --mode seatbelt, a sandbox-exec profile with the same reads inside the home folder, the
+   same writes, no network and no other programs; `process` mode elsewhere, which is weak and is recorded
+   as such), under time and memory limits.
 4. `acceptcheck check` imports the trusted modules only, replays every constant of the candidate's .olean
    files through the kernel, and asks the kernel to accept `Challenge.proof : Target := <theorem>`.
 5. The axioms of the challenge must be among propext, Classical.choice and Quot.sound.
@@ -199,9 +201,24 @@ def acceptcheck_binary() -> Path:
 
 
 # ---- the box -----------------------------------------------------------------------------------------
+BOX_MODES = ("hardened", "landlock", "seatbelt", "process")
+SEATBELT = "/usr/bin/sandbox-exec"
+
+
+def seatbelt_available() -> bool:
+    return sys.platform == "darwin" and os.path.exists(SEATBELT)
+
+
 def box_mode(want: str) -> str:
+    """The box: Landlock where the kernel has it (hardened or landlock), macOS's sandbox-exec when asked for by
+    name (seatbelt; not chosen by hardened until it has passed its test on a Mac), else the process box, which
+    only limits time and memory and is recorded as weak."""
     if want == "process":
         return "process"
+    if want == "seatbelt":
+        if not seatbelt_available():
+            raise Infra("seatbelt mode needs macOS with /usr/bin/sandbox-exec")
+        return "seatbelt"
     try:
         sys.path.insert(0, str(_repo))
         from core.sandbox import landlock_available
@@ -215,13 +232,65 @@ def box_mode(want: str) -> str:
 
 
 _repo: Path = Path(".")
+_work: Path | None = None  # the service's work folder (other candidates' workspaces, receipts): seatbelt refuses it
+
+
+def _sb(path) -> str:
+    return '"' + str(path).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _both(paths) -> list[str]:
+    """Each path as given and with its links resolved: a profile is matched against real paths."""
+    out = set()
+    for p in paths:
+        out.add(os.path.abspath(str(p)))
+        out.add(os.path.realpath(str(p)))
+    return sorted(out)
+
+
+def python_executables() -> list[str]:
+    """The programs that starting this Python runs: on a macOS framework build (python.org, Homebrew),
+    bin/python3.x replaces itself with the interpreter inside the framework's Python.app."""
+    import sysconfig
+    paths = [sys.executable]
+    framework = sysconfig.get_config_var("PYTHONFRAMEWORK")
+    if sys.platform == "darwin" and framework:
+        app = os.path.join(sys.base_prefix, "Resources", "Python.app", "Contents", "MacOS", framework)
+        if os.path.exists(app):
+            paths.append(app)
+    return _both(paths)
+
+
+def seatbelt_profile(ws: Path, read: list[str], deny_read: list[str], execs: list[str], read_write: list[str]) -> str:
+    """The sandbox-exec profile of one boxed command. Everything not named stays as macOS allows it (allow
+    default), and the rules after it take that away; in a profile a later rule wins over an earlier one, so
+    reading deny_read (the home folder, the work folder, the pipeline) is refused and then the paths the
+    Landlock box may read (read) are allowed again. Writing: ws/out, ws/tmp and the devices only. Programs:
+    Python (which runs _boxrun.py) and the command only. No network, no other process, no signal to another."""
+    rules = [
+        "(version 1)",
+        "(allow default)",
+        "(deny network*)",
+        "(deny process-fork)",
+        "(deny process-exec)",
+        "(allow process-exec " + " ".join(f"(literal {_sb(p)})" for p in _both(execs)) + ")",
+        "(deny signal)",
+        "(allow signal (target self))",
+        "(deny file-write*)",
+        "(allow file-write* " + " ".join(f"(subpath {_sb(p)})" for p in _both([ws / "out", ws / "tmp"]))
+        + "".join(f" (literal {_sb(p)})" for p in read_write) + ")",
+        "(deny file-read* " + " ".join(f"(subpath {_sb(p)})" for p in _both(deny_read)) + ")",
+        "(allow file-read* " + " ".join(f"(subpath {_sb(p)})" for p in _both(read)) + ")",
+        "(allow file-read-metadata)",  # finding one's way along a path; no contents, no listings
+    ]
+    return "\n".join(rules) + "\n"
 
 
 def run_boxed(ws: Path, cmd: list[str], env: dict, mode: str, timeout_s: float, read_extra: list[str]) -> dict:
     """Run cmd in the box rooted at ws (out/ and tmp/ writable). Returns rc, stdout, stderr, timed_out."""
     sys.path.insert(0, str(_repo))
     try:
-        from core.sandbox import SYSTEM_READ, DEVICE_READ, DEVICE_READ_WRITE, PROC_READ
+        from core.sandbox import SYSTEM_READ, DEVICE_READ, DEVICE_READ_WRITE, PROC_READ, python_paths
         import core.harness as harness
     finally:
         sys.path.pop(0)
@@ -237,10 +306,17 @@ def run_boxed(ws: Path, cmd: list[str], env: dict, mode: str, timeout_s: float, 
     job = {"policy": policy, "limits": {"RLIMIT_AS": MEMORY_MB << 20, "RLIMIT_CPU": int(timeout_s) + 60},
            "cwd": str(ws), "env": env, "cmd": cmd}
     (ws / "job.json").write_text(json.dumps(job))
+    argv = [sys.executable, "-I", "-B", str(ws / "_boxrun.py"), str(ws / "job.json")]
+    if mode == "seatbelt":
+        # the profile holds from the start, so Python's own folders must be readable too (in landlock mode
+        # _boxrun.py locks itself in after Python has started)
+        read = python_paths() + [p for p in SYSTEM_READ + DEVICE_READ if os.path.exists(p)] + [str(ws)] + read_extra
+        deny = [str(Path.home()), str(_repo)] + ([str(_work)] if _work else [])
+        profile = seatbelt_profile(ws, read, deny, python_executables() + [cmd[0]], list(DEVICE_READ_WRITE))
+        argv = [SEATBELT, "-p", profile] + argv
     t0 = time.time()
     try:
-        p = subprocess.run([sys.executable, "-I", "-B", str(ws / "_boxrun.py"), str(ws / "job.json")],
-                           capture_output=True, text=True, timeout=timeout_s, cwd=str(ws))
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s, cwd=str(ws))
     except subprocess.TimeoutExpired as exc:
         return {"rc": -9, "stdout": exc.stdout or "", "stderr": "timed out", "timed_out": True,
                 "seconds": round(time.time() - t0, 1)}
@@ -471,8 +547,8 @@ def last_json(text: str) -> dict | None:
 
 # ---- a submission -------------------------------------------------------------------------------------
 def submit(cdir: Path, repo: Path, work: Path, want_mode: str) -> dict:
-    global _repo
-    _repo = repo
+    global _repo, _work
+    _repo, _work = repo, work
     t0 = time.time()
     receipt = {"schema": RECEIPT_SCHEMA, "candidate_id": None, "status": None, "reason": None,
                "claim_kind": None, "certified_count": None, "domain_size": None, "claimed_count": None, "network": None,
@@ -487,7 +563,7 @@ def submit(cdir: Path, repo: Path, work: Path, want_mode: str) -> dict:
         receipt.update(candidate_id=manifest["candidate_id"], claimed_count=manifest["claimed_count"] if manifest["kind"] == "performance" else None,
                        network=manifest["network"], theorem=manifest["theorem"], claim_kind=manifest["kind"])
         mode = box_mode(want_mode)
-        receipt["isolation"] = mode if mode == "landlock" else "process (weak: no Landlock here)"
+        receipt["isolation"] = mode if mode in ("landlock", "seatbelt") else "process (weak: no Landlock here)"
         lean = lean_binary()
         lp = lean_path()
         # the service's identity, as `accept.py identity` reports it: a run checks every receipt against the
@@ -697,8 +773,8 @@ def compile_for_development(ws: Path, rel: str, repo: Path, model: str, network:
     """Compile <ws>/<rel> against the protected module of (network, claimed, certificate), in the box, with the
     workspace's own out/ on the path for its other modules. For a candidate's development, never for acceptance:
     returns {"ok", "timed_out", "module", "protected_module", "messages", "seconds"} or {"ok": False, "error"}."""
-    global _repo
-    _repo = repo
+    global _repo, _work
+    _repo, _work = repo, work
     if not re.match(r"^Candidate/([A-Za-z_][A-Za-z0-9_]*/)*[A-Za-z_][A-Za-z0-9_]*\.lean$", rel):
         return {"ok": False, "error": "the module path must be Candidate/<Name>.lean"}
     src = ws / rel
@@ -761,7 +837,7 @@ def main(argv=None) -> int:
     s.add_argument("candidate", type=Path)
     s.add_argument("--repo", type=Path, required=True, help="the pipeline repository")
     s.add_argument("--work", type=Path, required=True, help="networks, protected modules, workspaces and receipts")
-    s.add_argument("--mode", default="hardened", choices=("hardened", "landlock", "process"))
+    s.add_argument("--mode", default="hardened", choices=BOX_MODES)
     s.add_argument("--knowledge", default="minimal", choices=KNOWLEDGE_CONDITIONS)
     c = sub.add_parser("compile", help="compile a candidate module in a workspace, for development")
     c.add_argument("workspace", type=Path)
@@ -772,14 +848,14 @@ def main(argv=None) -> int:
     c.add_argument("--network", required=True)
     c.add_argument("--claimed", type=int, required=True)
     c.add_argument("--certificate", type=Path)
-    c.add_argument("--mode", default="hardened", choices=("hardened", "landlock", "process"))
+    c.add_argument("--mode", default="hardened", choices=BOX_MODES)
     c.add_argument("--knowledge", default="minimal", choices=KNOWLEDGE_CONDITIONS)
     p = sub.add_parser("protected")
     p.add_argument("network", type=Path)
     p.add_argument("claimed", type=int)
     p.add_argument("--repo", type=Path, required=True)
     p.add_argument("--work", type=Path, required=True)
-    p.add_argument("--mode", default="hardened", choices=("hardened", "landlock", "process"))
+    p.add_argument("--mode", default="hardened", choices=BOX_MODES)
     p.add_argument("--certificate", type=Path, help="a JSON list of numbers, for a scored submission's module")
     i = sub.add_parser("identity", help="the service's identity: commit, toolchain, project, policy and binary digests")
     i.add_argument("--knowledge", default="minimal", choices=KNOWLEDGE_CONDITIONS)
@@ -789,8 +865,8 @@ def main(argv=None) -> int:
     if args.cmd == "identity":
         print(json.dumps(identity(), indent=1))
         return 0
-    global _repo
-    _repo = args.repo.resolve()
+    global _repo, _work
+    _repo, _work = args.repo.resolve(), args.work.resolve()
     if args.cmd == "submit":
         r = submit(args.candidate.resolve(), _repo, args.work.resolve(), args.mode)
         print(json.dumps(r, indent=1))

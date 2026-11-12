@@ -1110,3 +1110,102 @@ def test_the_knowledge_condition_is_part_of_the_policy_digest():
     assert out["minimal"]["policy"] != out["maximum"]["policy"]
     assert {k: v for k, v in out["minimal"].items() if k != "policy"} == {k: v for k, v in out["maximum"].items() if k != "policy"}
 
+
+
+# ---- the seatbelt box (macOS's sandbox-exec) ------------------------------------------------------------
+# The profile and the command are tested here as text, on any machine; the two tests after them run only on a
+# Mac and are the box's real test (a proof accepted inside it, a write outside it refused).
+def _accept_module():
+    sys.path.insert(0, str(HERE))
+    import accept
+    sys.path.pop(0)
+    return accept
+
+
+def test_the_seatbelt_profile_reads_what_the_landlock_box_reads_and_writes_only_out_and_tmp(tmp_path):
+    accept = _accept_module()
+    ws, home, work = tmp_path / "work" / "ws", tmp_path / "home", tmp_path / "work"
+    text = accept.seatbelt_profile(ws, [str(ws), "/opt/lean"], [str(home), str(work)], ["/opt/py/bin/python3", "/opt/lean/bin/lean"],
+                                   ["/dev/null"])
+    lines = text.splitlines()
+    assert lines[:2] == ["(version 1)", "(allow default)"]
+    assert "(deny network*)" in lines and "(deny process-fork)" in lines and "(deny process-exec)" in lines
+    assert '(allow process-exec (literal "/opt/lean/bin/lean") (literal "/opt/py/bin/python3"))' in lines
+    assert "(deny signal)" in lines and "(allow signal (target self))" in lines
+    write = next(l for l in lines if l.startswith("(allow file-write*"))
+    assert write == f'(allow file-write* (subpath "{ws / "out"}") (subpath "{ws / "tmp"}") (literal "/dev/null"))'
+    assert lines.index("(deny file-write*)") < lines.index(write)
+    # a later rule wins: the home folder and the work folder are refused, then the workspace allowed again
+    deny = next(l for l in lines if l.startswith("(deny file-read*"))
+    allow = next(l for l in lines if l.startswith("(allow file-read*"))
+    assert f'(subpath "{home}")' in deny and f'(subpath "{work}")' in deny
+    assert f'(subpath "{ws}")' in allow and '(subpath "/opt/lean")' in allow
+    assert lines.index(deny) < lines.index(allow) and lines[-1] == "(allow file-read-metadata)"
+    assert accept._sb('/a "b') == '"/a \\"b"'
+
+
+def test_in_seatbelt_mode_the_command_starts_under_sandbox_exec(tmp_path, monkeypatch):
+    accept = _accept_module()
+    seen = []
+
+    def run(argv, **kw):
+        seen.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(accept.subprocess, "run", run)
+    monkeypatch.setattr(accept, "_repo", REPO)
+    monkeypatch.setattr(accept, "_work", tmp_path / "work")
+    ws = tmp_path / "work" / "ws"
+    ws.mkdir(parents=True)
+    r = accept.run_boxed(ws, ["/opt/lean/bin/lean", "-o", "x.olean", "x.lean"], {}, "seatbelt", 60, ["/opt/lean"])
+    assert r["rc"] == 0
+    argv = seen[0]
+    assert argv[:2] == [accept.SEATBELT, "-p"] and argv[3:] == [sys.executable, "-I", "-B", str(ws / "_boxrun.py"), str(ws / "job.json")]
+    profile = argv[2]
+    assert '(literal "/opt/lean/bin/lean")' in profile and f'(literal "{sys.executable}")' in profile
+    deny = next(l for l in profile.splitlines() if l.startswith("(deny file-read*"))
+    allow = next(l for l in profile.splitlines() if l.startswith("(allow file-read*"))
+    for p in (Path.home(), REPO, tmp_path / "work"):
+        assert f'(subpath "{os.path.realpath(p)}")' in deny
+    assert f'(subpath "{ws}")' in allow and '(subpath "/opt/lean")' in allow
+    # the box itself is _boxrun.py's: no Landlock policy in the job, the limits as in every mode
+    job = json.loads((ws / "job.json").read_text())
+    assert job["policy"] is None and job["limits"]["RLIMIT_AS"] == accept.MEMORY_MB << 20
+    # in the other modes nothing changes
+    seen.clear()
+    accept.run_boxed(ws, ["/opt/lean/bin/lean"], {}, "process", 60, [])
+    assert seen[0][0] == sys.executable
+
+
+def test_seatbelt_is_used_only_when_asked_for_and_only_on_a_mac(monkeypatch):
+    accept = _accept_module()
+    monkeypatch.setattr(accept, "_repo", REPO)
+    monkeypatch.setattr(accept, "seatbelt_available", lambda: False)
+    with pytest.raises(accept.Infra, match="seatbelt"):
+        accept.box_mode("seatbelt")
+    monkeypatch.setattr(accept, "seatbelt_available", lambda: True)
+    assert accept.box_mode("seatbelt") == "seatbelt"
+    assert accept.box_mode("hardened") in ("landlock", "process")
+    assert accept.box_mode("process") == "process"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="seatbelt is macOS only")
+def test_the_hand_built_proof_is_accepted_in_the_seatbelt_box(work):
+    r = submit(EXAMPLE, work, mode="seatbelt")
+    assert r["status"] == "accepted", r["reason"]
+    assert r["certified_count"] == 64 and r["isolation"] == "seatbelt"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="seatbelt is macOS only")
+def test_the_seatbelt_box_blocks_writes_and_reads_outside_it(work, tmp_path):
+    target = work / "receipts" / "forged-seatbelt.json"
+    src = SOURCE.replace("namespace Candidate.Max2Tiny",
+                         f'#eval IO.FS.writeFile "{target}" "{{}}"\n\nnamespace Candidate.Max2Tiny')
+    r = submit(variant(tmp_path, "writer-seatbelt", lean=src), work, mode="seatbelt")
+    assert r["status"] == "rejected" and "does not compile" in r["reason"]
+    assert not target.exists()
+    secret = REPO / "README.md"  # the pipeline: refused, as everything in the home folder outside the box
+    src = SOURCE.replace("namespace Candidate.Max2Tiny",
+                         f'#eval do let _ ← IO.FS.readFile "{secret}"; pure ()\n\nnamespace Candidate.Max2Tiny')
+    r = submit(variant(tmp_path, "reader-seatbelt", lean=src), work, mode="seatbelt")
+    assert r["status"] == "rejected" and "does not compile" in r["reason"]

@@ -34,7 +34,11 @@ of inputs the network answers correctly over the reals, ties counting as wrong.
    with the checker's reader (`parseNetwork`) and compares graph, weights and task.
 3. Compiles each candidate module with `lean` in a box: on Linux, Landlock with no sockets, reading only the
    toolchain, this project, the workspace and system files, writing only the workspace's `out/` and `tmp/`;
-   elsewhere a plain process, recorded in the receipt as weak isolation. Time and memory limits apply.
+   on macOS with `--mode seatbelt` (asked for by name until it has passed its test on a Mac), a
+   `sandbox-exec` profile with no network, no other programs and no signals, refusing to read the home
+   folder, the work folder and the pipeline except the paths the Landlock box may read, and writing only
+   the workspace's `out/` and `tmp/`; elsewhere a plain process, recorded in the receipt as weak isolation.
+   Time and memory limits apply.
 4. Runs `acceptcheck check` in the box: it imports the trusted modules only, replays every constant of the
    candidate's `.olean` files through the kernel (`Lean.Kernel.Environment.replay`, as lean4checker does),
    and asks the kernel to accept `Challenge.proof : Target := <theorem>`. No candidate source is elaborated
