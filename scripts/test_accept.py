@@ -116,11 +116,12 @@ def test_a_claim_above_the_count_is_rejected(work, tmp_path):
     assert r["status"] == "rejected" and "0 to 64" in r["reason"]
     r = submit(variant(tmp_path, "claim-63-mismatch", manifest={"claimed_count": 63}), work)
     assert r["status"] == "rejected" and "imports" in r["reason"]
-    # a proof of a count the kernel finds false does not compile (one input is fine; D is 64, not 63)
+    # a proof of a count the kernel finds false is rejected by the kernel's replay (one input is fine; D is 64,
+    # not 63): a submission is compiled without the kernel's check, so the replay is where it fails
     src = SOURCE.replace("D weights = 64", "D weights = 63").replace("claimedCount = 64 := rfl", "claimedCount = 63 := rfl")
     src = src.replace("_c64", "_c63")
     r = submit(variant(tmp_path, "claim-63-tried", lean=src, manifest={"claimed_count": 63}), work)
-    assert r["status"] == "rejected" and "does not compile" in r["reason"]
+    assert r["status"] == "rejected" and "the kernel rejects the candidate" in r["reason"], r["reason"]
 
 
 def test_sorry_is_rejected(work, tmp_path):
@@ -729,12 +730,14 @@ def long_bill(tmp_path: Path, name: str, k: int, option: str) -> Path:
 
 def test_a_long_bill_is_one_decided_instance_with_the_recursion_limit_raised(work, tmp_path):
     """27 October: Lean's default recursion limit (maxRecDepth 512) stops `decide +kernel` on a bill of a few
-    thousand charges, which the bill's list of `Cost.add` builds one charge at a time; the open lane's first
-    attention pilot built a model of its checker and run lemmas to get past it. The option raises the limit
-    while the candidate compiles; the service's replay does not need it. 5,000 one-unit charges: rejected
-    without the option, accepted and scored with it (bill 5,000, extract 80)."""
+    thousand charges, which the bill's list of `Cost.add` builds one charge at a time, when the kernel checks
+    the fact as Lean compiles it; the open lane's first attention pilot built a model of its checker and run
+    lemmas to get past it. The option raises the limit while the candidate compiles; the service's replay does
+    not need it. Since 13 November a submission is compiled without the kernel's check, so the limit no longer
+    applies there: 5,000 one-unit charges are accepted and scored with or without the option (bill 5,000,
+    extract 80). A development compile, which keeps the kernel's check, still needs it."""
     r = submit(long_bill(tmp_path, "long-bill-default", 5000, ""), work)
-    assert r["status"] == "rejected" and "deep recursion" in r["reason"], r
+    assert r["status"] == "accepted" and r["scoring"]["status"] == "scored", r
     r = submit(long_bill(tmp_path, "long-bill-raised", 5000, "set_option maxRecDepth 1000000 in\n"), work)
     assert r["status"] == "accepted", r["reason"]
     s = r["scoring"]
