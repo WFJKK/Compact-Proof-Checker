@@ -329,6 +329,23 @@ def test_a_checker_outside_the_counted_language_is_refused_scoring(work, tmp_pat
     assert s["status"] == "refused" and "Interp.counting" in s["reason"] and "CostM.billed" in s["reason"], s
 
 
+def test_a_checker_may_compare_a_list_with_the_empty_list(work, tmp_path):
+    """`a = []` elaborates to `List.instDecidableEqNil`, which decides it by matching on the list without looking at
+    its elements (as `List.isEmpty`); allowed from policy v8. Run attn-min2-ptl-1 (12 November 2026): the agent's
+    shape check `sC ≠ []` on a 0-d weight was refused scoring for this constant alone."""
+    src = SCORED_SOURCE.replace(NEW_D, "def D : Checker := fun I => countSingles I graph task "
+                                      "(if task.space ≠ [] ∧ [] ≠ task.space then allInputs task.space else [])")
+    src = src.replace("  intro w c n cost h\n  unfold numCorrect\n  exact countSingles_le ⟨w, c⟩ (allInputs task.space) [] n cost h",
+                      "  intro w c n cost h\n  unfold numCorrect\n  simp only [D] at h\n"
+                      "  rw [if_pos (by decide : task.space ≠ [] ∧ [] ≠ task.space)] at h\n"
+                      "  exact countSingles_le ⟨w, c⟩ (allInputs task.space) [] n cost h")
+    r = submit(scored_variant(tmp_path, "nil-test", src), work)
+    assert r["status"] == "accepted", r["reason"]
+    s = r["scoring"]
+    assert s["status"] == "scored", s
+    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v8"
+
+
 # ---- kinds, assurance, zero coverage, the development compile --------------------------------------------
 def test_an_auxiliary_lemma_is_accepted_without_a_count(work, tmp_path):
     r = submit(variant(tmp_path, "aux-lemma", manifest={"kind": "auxiliary", "theorem": "Candidate.Max2Tiny.D_sound"}), work)
@@ -835,7 +852,7 @@ def test_a_checker_may_build_a_graph_of_the_linear_family_and_run_single_on_it(w
     assert r["status"] == "accepted" and r["certified_count"] == 64, r["reason"]
     s = r["scoring"]
     assert s["status"] == "scored", s
-    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v7"
+    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v8"
 
 
 def test_weight_sizes_are_read_for_free(work, tmp_path):

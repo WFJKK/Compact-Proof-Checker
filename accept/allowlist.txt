@@ -452,6 +452,10 @@ List.head!
 List.tail
 List.tail!
 List.isEmpty
+# equality with [] decided by matching on the list, without looking at its elements (as List.isEmpty); what
+# Lean elaborates `a = []` and `[] = a` to (run attn-min2-ptl-1, 12 November 2026; policy v8)
+List.instDecidableEqNil
+List.instDecidableNilEq
 List.length_cons
 List.product
 List.partition

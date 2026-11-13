@@ -89,6 +89,9 @@ TRUSTED_PREFIXES = ("CompactCheck.", "Mathlib.")
 KINDS = ("performance", "auxiliary")  # a proof of Target, or a lemma: accepted with no count and no score
 COST_MODEL = "cost-v3"  # the prices (CountedCheck.lean, core/check/cost.py of the pipeline): unchanged since the open lane began
 # the open lane's policy around those prices, versioned: what a checker may use for free and the budgets.
+# v8 (13 November 2026): List.instDecidableEqNil and List.instDecidableNilEq on the allowlist, the instances Lean
+# elaborates `a = []` and `[] = a` to; they match on the list without looking at its elements, as List.isEmpty
+# (already allowed) does. Run attn-min2-ptl-1's round-3 checker was refused scoring for the first alone.
 # v7 (23 October 2026, evening): the maximum condition adds the fixed rules lane's token_interval rule for general
 # networks, `Interp.gtokenIntervals` (a list of leaves per call; the rows that depend on their token alone are
 # charged once per call, as cost-v3 charges them once per proof).
@@ -103,7 +106,7 @@ COST_MODEL = "cost-v3"  # the prices (CountedCheck.lean, core/check/cost.py of t
 # v4 (22 October, after pilot 2 and review round 7): a free weightSize read, graph constructors of the
 # linear family and two audited match-compiler constants on the allowlist. v3 (21 October): language
 # version 4 and the description-size budget. Recorded in every receipt and in the policy digest.
-POLICY_VERSION = "open-lane-policy-v7"
+POLICY_VERSION = "open-lane-policy-v8"
 ASSURANCE = "kernel_checked_instance"  # a scored result's count and bill are both kernel-checked, never executed
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 IMPORT_LINE = re.compile(r"^\s*import\s+([A-Za-z_][A-Za-z0-9_.]*)\s*$")
