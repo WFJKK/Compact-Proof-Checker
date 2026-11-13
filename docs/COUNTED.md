@@ -1,4 +1,4 @@
-# The counted language (step 2 of the open lane; version 4 of the language, policy v7, 23 October)
+# The counted language (step 2 of the open lane; version 4 of the language, policy v9, 13 November)
 
 How a scored open-lane proof gets a length: its checker `D` is written against an abstract interpreter
 whose operations are the only way to touch a number of the network, the service runs it with the
@@ -116,6 +116,12 @@ along equations between concrete values, since no operation yields an equation b
 `Nat.ne_of_beq_eq_false` (a theorem, produced by a wildcard in a recursion over two lists). The pilot's
 first proof had been refused for the former. The policy's version is in every receipt (`policy_version`)
 and in the policy digest; the prices themselves (`cost-v3`) are unchanged.
+
+The same closure, with the checker's description size, can be asked for during development:
+`accept.py compile --checker <constant>` runs it after a successful compile and reports whether the checker
+stays in the counted language (and the constants it is refused for), its description size against the budget,
+measured by the same functions as `score`, and its largest definitions. It is a preview, not a verdict: the
+soundness and instance theorems and the general layer's kernel time are checked only on submission.
 
 ## The two statements (`acceptcheck score`)
 
@@ -319,8 +325,9 @@ A scored submission adds to its manifest
 
     "scored": {"checker": ..., "sound": ..., "instance": ..., "certificate": [numbers], "claimed_bill": L}
 
-The certificate (integers, floats, or `[p, q]` pairs) becomes the protected module's `cert`, and its hash
-becomes part of the module's name. The receipt's `claim_kind` is `performance` (a proof of Target) or
+and, for a planned checker, `"plan": [natural numbers]`. The certificate (integers, floats, or `[p, q]` pairs)
+becomes the protected module's `cert`, and its hash becomes part of the module's name; a plan becomes its
+`plan`, with its own hash in the name. The receipt's `claim_kind` is `performance` (a proof of Target) or
 `auxiliary` (a lemma with any statement, accepted with no count and no score: `"kind": "auxiliary"` in the
 manifest), `score_eligible` says whether it was scored, and the `scoring` block says `scored` or `refused`
 (with the reason) and gives the length in `cost-v3` units:
@@ -333,6 +340,32 @@ operations, `extract`
 and `read` as above, the arithmetic categories through the primitives. `tree` has no counterpart: the
 structure of a scored proof is its program, bounded by the literal budget below rather than charged. The
 fixed rules lane does not charge a proof file's plan either, so the same proof costs the same in both lanes.
+
+## Planned checkers (policy v9, 13 November 2026)
+
+A checker often needs data computed offline that says where to look: which inputs go into which group, where a
+loop stops. Written into the checker's code it counts toward the description size, and a certificate cannot
+carry it (`I.cert` returns an abstract number, not an index). A planned checker takes it as an argument:
+
+    D : List Nat → Checker
+    theorem D_sound : ∀ (p : List Nat) (w : Weights ℚ) (c : Cert) (n : Nat) (cost : Cost),
+        CostM.exec (D p Interp.counting) ⟨w, c⟩ = some (n, cost) → n ≤ numCorrect graph w task
+    theorem D_instance : CostM.billed (D plan Interp.counting) ⟨weights, cert⟩ = some (N, L)
+
+`acceptcheck score-planned` asks the kernel for these two statements. The plan is
+
+- free: it is ordinary Lean data the checker reads, as the fixed rules lane's plan is free (cost-v4); turning
+  an entry into a number for arithmetic goes through `I.lit`, charged 1, as reading a certificate number is;
+- not trusted: the soundness theorem holds for every plan, and the general layer may not mention the protected
+  module's `plan` (only `graph` and `task`), so only the instance runs the checker on it;
+- bounded as the fixed rules lane bounds its tree: at most 4 entries per input plus 10,000, each below 2^32
+  (`plan_problem` in `accept.py`; the bounds are in the policy digest).
+
+Nothing can hide in it for the same reason as in that lane: the plan only says which checks run where, every
+check's work on numbers is charged where it runs, and a soundness proof cannot rely on what the plan says.
+`examples/open_lane/max2_tiny_planned` chooses 60 of the 64 inputs by a plan of 64 flags (bill 3,780, length
+3,860); the tests show that a soundness theorem for one plan only, or one that names the protected plan, is
+refused scoring, as is a plan over its bounds. Unplanned submissions are checked exactly as before.
 
 ## General-layer safeguards
 

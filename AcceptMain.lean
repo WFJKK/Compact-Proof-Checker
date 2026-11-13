@@ -27,6 +27,12 @@ candidate's constant has the target's type. The last line of output is a JSON ob
 
     acceptcheck score <protected module> <checker> <sound> <instance> <claimed count> <claimed bill>
                       <trusted modules...> -- <candidate .olean files...>
+    acceptcheck score-planned <the same arguments>
+
+`score-planned` is the same for a planned checker `D : List Nat → Checker`: the soundness shape quantifies over
+every plan `p` as well (`CostM.exec (D p Interp.counting) ⟨w, c⟩`), the instance runs `D` on the protected
+module's `plan`, and the general layer may not mention that `plan`, so the plan steers the checker but is never
+trusted.
 
 The scored path (docs/COUNTED.md): after the same replay, asks the kernel to accept two theorems whose
 statements this program builds itself, `Challenge.sound` at the fixed soundness shape of the checker
@@ -185,6 +191,37 @@ def soundType (D graph task : Name) : Expr :=
 def instanceType (D weights cert : Name) (n bill : Nat) : Expr :=
   eqE (optionT (prodT natT natT))
     (mkApp3 (mkConst ``CompactCheck.CostM.billed) natT (counted D) (envE (mkConst weights) (mkConst cert)))
+    (someE (prodT natT natT) (pairE natT natT (mkNatLit n) (mkNatLit bill)))
+
+/-! A planned checker `D : List Nat → Checker` takes a plan: whole numbers that steer it (which inputs to group,
+where a loop stops), read for free as Lean data, never through the interpreter. The plan is not trusted: the
+soundness shape quantifies over every plan, and the general layer may not mention the protected module's `plan`
+(`generalMayUse`); only the instance runs `D` on it. -/
+
+def listNatT : Expr := mkApp (mkConst ``List [Level.zero]) natT
+
+/-- A planned checker on the plan `p`, run by the counting interpreter: `D p Interp.counting : CostM Nat`. -/
+def countedPlanned (D : Name) (p : Expr) : Expr := mkApp2 (mkConst D) p (mkConst ``CompactCheck.Interp.counting)
+
+/-- The soundness shape of a planned checker, for every plan:
+    `∀ (p : List Nat) (w : Weights ℚ) (c : Cert) (n : Nat) (cost : Cost),
+      CostM.exec (D p Interp.counting) ⟨w, c⟩ = some (n, cost) → n ≤ numCorrect graph w task`. -/
+def soundTypePlanned (D graph task : Name) : Expr :=
+  -- inside the hypothesis: p = bvar 4, w = bvar 3, c = bvar 2, n = bvar 1, cost = bvar 0
+  let hyp := eqE (optionT (prodT natT costT))
+    (mkApp3 (mkConst ``CompactCheck.CostM.exec) natT (countedPlanned D (mkBVar 4)) (envE (mkBVar 3) (mkBVar 2)))
+    (someE (prodT natT costT) (pairE natT costT (mkBVar 1) (mkBVar 0)))
+  -- inside the conclusion: p = bvar 5, w = bvar 4, c = bvar 3, n = bvar 2, cost = bvar 1, h = bvar 0
+  let concl := mkApp4 (mkConst ``LE.le [Level.zero]) natT (mkConst ``instLENat) (mkBVar 2)
+    (mkApp3 (mkConst ``CompactCheck.numCorrect) (mkConst graph) (mkBVar 4) (mkConst task))
+  mkForall `p .default listNatT (mkForall `w .default weightsT (mkForall `c .default certT (mkForall `n .default natT
+    (mkForall `cost .default costT (mkForall `h .default hyp concl)))))
+
+/-- The planned instance: `CostM.billed (D plan Interp.counting) ⟨weights, cert⟩ = some (n, bill)`, on the
+    protected module's plan. -/
+def instanceTypePlanned (D weights cert plan : Name) (n bill : Nat) : Expr :=
+  eqE (optionT (prodT natT natT))
+    (mkApp3 (mkConst ``CompactCheck.CostM.billed) natT (countedPlanned D (mkConst plan)) (envE (mkConst weights) (mkConst cert)))
     (someE (prodT natT natT) (pairE natT natT (mkNatLit n) (mkNatLit bill)))
 
 /-- The candidate's constants, by name: `none` with a reason if one is a trusted constant's name (other than an
@@ -348,12 +385,12 @@ def challenge (kenv : Kernel.Environment) (name : Name) (type : Expr) (value : N
 def generalMayUse (prot : Name) (n : Name) : Bool :=
   !(prot.isPrefixOf n) || n == prot ++ `graph || n == prot ++ `task
 
-def runScore (prot D sound inst : Name) (n bill : Nat) (trusted : List Name) (oleans : List String) :
-    IO UInt32 := do
+def runScore (prot D sound inst : Name) (n bill : Nat) (trusted : List Name) (oleans : List String)
+    (planned : Bool := false) : IO UInt32 := do
   initSearchPath (← findSysroot)
   let env ← importModules (trusted.toArray.map fun m => { module := m : Import }) {} (trustLevel := 0)
   let kenv := env.toKernelEnv
-  for c in [prot ++ `graph, prot ++ `weights, prot ++ `task, prot ++ `cert] do
+  for c in [prot ++ `graph, prot ++ `weights, prot ++ `task, prot ++ `cert] ++ (if planned then [prot ++ `plan] else []) do
     if (kenv.find? c).isNone then
       return ← rejected s!"the protected module has no constant {c}"
   let cs ← match ← candidateConstants kenv oleans with
@@ -386,10 +423,13 @@ def runScore (prot D sound inst : Name) (n bill : Nat) (trusted : List Name) (ol
     | .ok r => pure r
     | .error e => return ← rejected e
   let t0 ← IO.monoMsNow
-  let kenv ← match ← challenge kenv `Challenge.sound (soundType D (prot ++ `graph) (prot ++ `task)) sound with
+  let soundT := if planned then soundTypePlanned D (prot ++ `graph) (prot ++ `task) else soundType D (prot ++ `graph) (prot ++ `task)
+  let instT := if planned then instanceTypePlanned D (prot ++ `weights) (prot ++ `cert) (prot ++ `plan) n bill
+    else instanceType D (prot ++ `weights) (prot ++ `cert) n bill
+  let kenv ← match ← challenge kenv `Challenge.sound soundT sound with
     | .ok k => pure k
     | .error e => return ← rejected e
-  let kenv ← match ← challenge kenv `Challenge.instance (instanceType D (prot ++ `weights) (prot ++ `cert) n bill) inst with
+  let kenv ← match ← challenge kenv `Challenge.instance instT inst with
     | .ok k => pure k
     | .error e => return ← rejected e
   let challengeMs := (← IO.monoMsNow) - t0
@@ -552,6 +592,7 @@ end Accept
 def usage : String :=
   "usage: acceptcheck check <target> <candidate const> <trusted modules...> -- <candidate oleans...>\n" ++
   "       acceptcheck score <protected module> <checker> <sound> <instance> <count> <bill> <trusted modules...> -- <candidate oleans...>\n" ++
+  "       acceptcheck score-planned <protected module> <checker> <sound> <instance> <count> <bill> <trusted modules...> -- <candidate oleans...>\n" ++
   "       acceptcheck lemma <theorem> <trusted modules...> -- <candidate oleans...>\n" ++
   "       acceptcheck size <checker const> <trusted modules...> -- <candidate oleans...>\n" ++
   "       acceptcheck closure <checker const> <allowlist> <protected module> <trusted modules...> -- <candidate oleans...>\n" ++
@@ -575,6 +616,18 @@ def main (args : List String) : IO UInt32 := do
         IO.eprintln usage
         return 2
       Accept.runScore prot.toName D.toName sound.toName inst.toName n bill (trusted.map String.toName) oleans
+    | _, _ =>
+      IO.eprintln usage
+      return 2
+  | "score-planned" :: prot :: D :: sound :: inst :: n :: bill :: rest =>
+    let (trusted, oleans) := rest.span (· != "--")
+    let oleans := oleans.drop 1
+    match n.toNat?, bill.toNat? with
+    | some n, some bill =>
+      if oleans.isEmpty then
+        IO.eprintln usage
+        return 2
+      Accept.runScore prot.toName D.toName sound.toName inst.toName n bill (trusted.map String.toName) oleans (planned := true)
     | _, _ =>
       IO.eprintln usage
       return 2

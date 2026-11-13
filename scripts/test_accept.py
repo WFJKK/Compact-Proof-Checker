@@ -343,7 +343,88 @@ def test_a_checker_may_compare_a_list_with_the_empty_list(work, tmp_path):
     assert r["status"] == "accepted", r["reason"]
     s = r["scoring"]
     assert s["status"] == "scored", s
-    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v8"
+    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v9"
+
+
+# ---- planned checkers (policy v9) ---------------------------------------------------------------------------
+PLANNED = PROJECT / "examples" / "open_lane" / "max2_tiny_planned"
+PLANNED_SOURCE = (PLANNED / "Candidate" / "Max2TinyPlanned.lean").read_text()
+PLANNED_PLAN = json.loads((PLANNED / "manifest.json").read_text())["scored"]["plan"]
+
+
+def planned_variant(tmp_path: Path, name: str, lean: str | None = None, plan: list | None = None) -> Path:
+    """A copy of the planned example; with `plan`, the manifest's plan and the protected module's name in the
+    source follow it."""
+    d = variant(tmp_path, name, lean=lean, module_path="Candidate/Max2TinyPlanned.lean", base=PLANNED)
+    if plan is not None:
+        sys.path.insert(0, str(HERE))
+        import make_protected
+        sys.path.pop(0)
+        old = make_protected.module_name("max2_tiny-v8-s0", 60, None, PLANNED_PLAN)
+        new = make_protected.module_name("max2_tiny-v8-s0", 60, None, plan)
+        src = d / "Candidate" / "Max2TinyPlanned.lean"
+        src.write_text(src.read_text().replace(old, new))
+        m = json.loads((d / "manifest.json").read_text())
+        m["scored"]["plan"] = plan
+        (d / "manifest.json").write_text(json.dumps(m))
+    return d
+
+
+def test_a_planned_checker_is_scored_and_its_plan_is_free(work):
+    """The plan chooses 60 of the 64 inputs; the checker runs the single rule on those. The plan costs nothing,
+    is not part of the description size, and the receipt says how long it was."""
+    r = submit(PLANNED, work)
+    assert r["status"] == "accepted" and r["certified_count"] == 60, r["reason"]
+    s = r["scoring"]
+    assert s["status"] == "scored", s
+    assert s["bill"] == 60 * 63 and s["read"] == 0 and s["length"] == s["bill"] + s["extract"] + s["read"]
+    assert s["plan_entries"] == 64 and s["description_size"] <= s["size_budget"]
+    assert r["policy_version"] == "open-lane-policy-v9"
+
+
+def test_a_planned_soundness_proof_must_hold_for_every_plan(work, tmp_path):
+    """A plan is not trusted. A soundness theorem about one plan, written into the candidate as a literal copy, is
+    not the shape the kernel is asked to accept (for every plan): refused scoring, still verified. One that names
+    the protected module's plan is refused by the general-layer rule, which allows only graph and task."""
+    copy = "def myPlan : List Nat := [" + ", ".join(str(v) for v in PLANNED_PLAN) + "]\n\n"
+    src = PLANNED_SOURCE.replace("/-- The planned checker", copy + "/-- The planned checker")
+    src = src.replace("theorem D_sound : ∀ (p : List Nat) (w : Weights ℚ) (c : Cert) (n : Nat) (cost : Cost),\n"
+                      "    CostM.exec (D p Interp.counting) ⟨w, c⟩ = some (n, cost) → n ≤ numCorrect graph w task := by\n"
+                      "  intro p w c n cost h",
+                      "theorem D_sound : ∀ (w : Weights ℚ) (c : Cert) (n : Nat) (cost : Cost),\n"
+                      "    CostM.exec (D myPlan Interp.counting) ⟨w, c⟩ = some (n, cost) → n ≤ numCorrect graph w task := by\n"
+                      "  intro w c n cost h")
+    src = src.replace("pick p (allInputs task.space)) [] n cost h)\n    (pick_sublist p (allInputs task.space))",
+                      "pick myPlan (allInputs task.space)) [] n cost h)\n    (pick_sublist myPlan (allInputs task.space))")
+    src = src.replace("exact D_sound plan weights cert 60 cost h", "exact D_sound weights cert 60 cost h")
+    assert "myPlan Interp.counting" in src and "D_sound weights cert 60" in src
+    r = submit(planned_variant(tmp_path, "one-plan", lean=src), work)
+    assert r["status"] == "accepted" and r["certified_count"] == 60, r["reason"]
+    s = r["scoring"]
+    assert s["status"] == "refused" and "Challenge.sound" in s["reason"], s
+    src2 = src.replace("CostM.exec (D myPlan Interp.counting)", "CostM.exec (D plan Interp.counting)")
+    r = submit(planned_variant(tmp_path, "protected-plan", lean=src2), work)
+    assert r["status"] == "accepted", r["reason"]
+    s = r["scoring"]
+    assert s["status"] == "refused" and ".plan" in s["reason"] and "only" in s["reason"], s
+
+
+def test_a_plan_over_its_bounds_is_refused_scoring(work, tmp_path):
+    """At most 4 entries per input plus 10,000, each below 2^32, as the fixed rules lane bounds its plan. Entries
+    past the 64 inputs are ignored by this checker, so both proofs still verify; only scoring refuses them."""
+    long = PLANNED_PLAN + [5] * (4 * 64 + 10_000 - 64 + 1)
+    r = submit(planned_variant(tmp_path, "long-plan", plan=long), work)
+    assert r["status"] == "accepted" and r["certified_count"] == 60, r["reason"]
+    assert r["scoring"]["status"] == "refused" and "more than 10256" in r["scoring"]["reason"], r["scoring"]
+    big = PLANNED_PLAN[:-1] + [2 ** 32]
+    r = submit(planned_variant(tmp_path, "big-entry", plan=big), work)
+    assert r["status"] == "accepted" and r["certified_count"] == 60, r["reason"]
+    assert r["scoring"]["status"] == "refused" and "not below 2^32" in r["scoring"]["reason"], r["scoring"]
+    bad = json.loads((PLANNED / "manifest.json").read_text())
+    bad["scored"]["plan"] = [1, -1]
+    d = variant(tmp_path, "negative-plan", manifest=bad, module_path="Candidate/Max2TinyPlanned.lean", base=PLANNED)
+    r = submit(d, work)
+    assert r["status"] == "rejected" and "scored.plan" in r["reason"], r["reason"]
 
 
 # ---- kinds, assurance, zero coverage, the development compile --------------------------------------------
@@ -890,7 +971,7 @@ def test_a_checker_may_build_a_graph_of_the_linear_family_and_run_single_on_it(w
     assert r["status"] == "accepted" and r["certified_count"] == 64, r["reason"]
     s = r["scoring"]
     assert s["status"] == "scored", s
-    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v8"
+    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v9"
 
 
 def test_weight_sizes_are_read_for_free(work, tmp_path):

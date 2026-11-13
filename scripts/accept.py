@@ -89,6 +89,11 @@ TRUSTED_PREFIXES = ("CompactCheck.", "Mathlib.")
 KINDS = ("performance", "auxiliary")  # a proof of Target, or a lemma: accepted with no count and no score
 COST_MODEL = "cost-v3"  # the prices (CountedCheck.lean, core/check/cost.py of the pipeline): unchanged since the open lane began
 # the open lane's policy around those prices, versioned: what a checker may use for free and the budgets.
+# v9 (13 November 2026): planned checkers. A scored manifest may give a plan (natural numbers); the checker is
+# then `D : List Nat → Checker`, its soundness theorem holds for every plan and its instance runs on the protected
+# module's `plan`, which the general layer may not mention. The plan is free, as the fixed rules lane's plan is
+# (cost-v4), and bounded as that lane bounds its tree (PLAN_PER_INPUT, PLAN_BASE, PLAN_ENTRY_BITS). Unplanned
+# submissions are checked exactly as in v8.
 # v8 (13 November 2026): List.instDecidableEqNil and List.instDecidableNilEq on the allowlist, the instances Lean
 # elaborates `a = []` and `[] = a` to; they match on the list without looking at its elements, as List.isEmpty
 # (already allowed) does. Run attn-min2-ptl-1's round-3 checker was refused scoring for the first alone.
@@ -106,7 +111,7 @@ COST_MODEL = "cost-v3"  # the prices (CountedCheck.lean, core/check/cost.py of t
 # v4 (22 October, after pilot 2 and review round 7): a free weightSize read, graph constructors of the
 # linear family and two audited match-compiler constants on the allowlist. v3 (21 October): language
 # version 4 and the description-size budget. Recorded in every receipt and in the policy digest.
-POLICY_VERSION = "open-lane-policy-v8"
+POLICY_VERSION = "open-lane-policy-v9"
 ASSURANCE = "kernel_checked_instance"  # a scored result's count and bill are both kernel-checked, never executed
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 IMPORT_LINE = re.compile(r"^\s*import\s+([A-Za-z_][A-Za-z0-9_.]*)\s*$")
@@ -129,6 +134,14 @@ KNOWLEDGE = "minimal"
 # checks the arithmetic on every exported network). On a tiny network (E = 80) the whole set of weights is
 # smaller than any checker, and the budget cannot separate them. The environment variables are hooks for
 # tests; whatever is in force is in the policy digest and the receipt.
+# A planned checker's plan is free and untrusted (the soundness theorem holds for every plan), and bounded as the
+# fixed rules lane bounds its plan, the proof file's tree (core/check/checker.py: 4 nodes per input plus 10,000):
+# at most PLAN_PER_INPUT entries per input of the domain plus PLAN_BASE, each below 2^PLAN_ENTRY_BITS, so that it
+# holds indices and counts, as a plan does. Turning an entry into a number for arithmetic goes through `I.lit`,
+# charged 1, as reading a certificate number is.
+PLAN_PER_INPUT = 4
+PLAN_BASE = 10_000
+PLAN_ENTRY_BITS = 32
 SIZE_BUDGET_BASE = int(os.environ.get("ACCEPT_SIZE_BUDGET_BASE", 8192))
 SIZE_BUDGET_PER_PARAM = int(os.environ.get("ACCEPT_SIZE_BUDGET_PER_PARAM", 4))
 GENERAL_KERNEL_BUDGET_MS = 120_000  # kernel time to replay the general layer
@@ -136,6 +149,17 @@ GENERAL_KERNEL_BUDGET_MS = 120_000  # kernel time to replay the general layer
 
 def size_budget(extract: int) -> int:
     return SIZE_BUDGET_BASE + SIZE_BUDGET_PER_PARAM * extract
+
+
+def plan_problem(plan: list, domain: int) -> str | None:
+    """Why a plan is over its bounds, or None."""
+    cap = PLAN_PER_INPUT * domain + PLAN_BASE
+    if len(plan) > cap:
+        return f"the plan has {len(plan)} entries, more than {cap} ({PLAN_PER_INPUT} per input plus {PLAN_BASE})"
+    big = next((i for i, v in enumerate(plan) if v >= 1 << PLAN_ENTRY_BITS), None)
+    if big is not None:
+        return f"plan entry {big} is {plan[big]}, not below 2^{PLAN_ENTRY_BITS}"
+    return None
 
 
 class Reject(Exception):
@@ -488,13 +512,19 @@ def read_manifest(cdir: Path) -> dict:
             s["certificate"] = make_protected.canonical_cert(s.get("certificate", []))
         except make_protected.ProtectedError as exc:
             raise Reject(f"scored.certificate: {exc}")
+        if "plan" in s:  # a planned checker; its size is checked when scoring (plan_problem)
+            try:
+                s["plan"] = make_protected.canonical_plan(s["plan"])
+            except make_protected.ProtectedError as exc:
+                raise Reject(f"scored.plan: {exc}")
     return m
 
 
 # ---- the protected module ---------------------------------------------------------------------------
 def build_protected(net_json: Path, claimed: int, work: Path, lean: Path, lp: list[str], mode: str,
-                    cert: list | None = None) -> dict:
-    """Write, compile and verify the protected module; returns {module, olean, ...}. Cached by content."""
+                    cert: list | None = None, plan: list | None = None) -> dict:
+    """Write, compile and verify the protected module; returns {module, olean, ...}. Cached by content. With a
+    plan (a planned checker's), the module also has the constant `plan`."""
     sys.path.insert(0, str(HERE))
     try:
         import make_protected
@@ -502,7 +532,7 @@ def build_protected(net_json: Path, claimed: int, work: Path, lean: Path, lp: li
         sys.path.pop(0)
     net = json.loads(net_json.read_text())
     try:
-        name, src = make_protected.render(net, claimed, cert)
+        name, src = make_protected.render(net, claimed, cert, plan)
     except make_protected.ProtectedError as exc:
         if "not supported" in str(exc):
             raise Unsupported(str(exc))
@@ -520,6 +550,8 @@ def build_protected(net_json: Path, claimed: int, work: Path, lean: Path, lp: li
     srcp = ws / "Protected" / f"{name}.lean"
     srcp.write_text(src)
     (ws / "cert.json").write_text(json.dumps(cert or []))
+    if plan is not None:
+        (ws / "plan.json").write_text(json.dumps(plan))
     res = compile_module(ws, ws, module, srcp, lean, lp, mode)
     if res["timed_out"]:
         raise Infra("compiling the protected module timed out")
@@ -585,7 +617,7 @@ def submit(cdir: Path, repo: Path, work: Path, want_mode: str) -> dict:
         receipt["digests"]["network_file"] = sha256_file(net_json)
         scored = manifest.get("scored")
         prot = build_protected(net_json, manifest["claimed_count"], work, lean, lp, mode,
-                               scored["certificate"] if scored else None)
+                               scored["certificate"] if scored else None, scored.get("plan") if scored else None)
         receipt["domain_size"] = prot["domain"]
         receipt["steps"].append({"step": "protected", "module": prot["module"], "cached": prot["cached"]})
         deps = {m: check_imports(p.read_text(), m, set(modules), prot["module"]) for m, p in modules.items()}
@@ -658,8 +690,10 @@ def score(scored: dict, manifest: dict, prot: dict, net_json: Path, trusted: lis
     net = json.loads(net_json.read_text())
     extract = extraction_cost(net)
     read = len(scored["certificate"])
+    plan = scored.get("plan")
     out = {"status": None, "reason": None, "assurance": ASSURANCE, "cost_model": COST_MODEL,
            "bill": None, "extract": extract, "read": read, "length": None,
+           "plan_entries": None if plan is None else len(plan),
            "description_size": None, "size_budget": None if extract is None else size_budget(extract),
            "general_kernel_ms": None, "general_kernel_budget_ms": GENERAL_KERNEL_BUDGET_MS, "rest_kernel_ms": None,
            "axioms": None}
@@ -668,6 +702,11 @@ def score(scored: dict, manifest: dict, prot: dict, net_json: Path, trusted: lis
         out.update(status="refused", reason="the network has operations that do not depend on the input and cost "
                    "something; cost-v3 charges them to extract once, which the open lane does not compute yet")
         return out
+    if plan is not None:
+        why = plan_problem(plan, prot["domain"])
+        if why:
+            out.update(status="refused", reason=why)
+            return out
     read_extra = [str(toolchain_root(lean)), str(LEAN_PROJECT)] + lp_all
     # the checker touches numbers only through the counted primitives
     allowlist = ws / "allowlist.txt"  # the list in force, written where the box can read it
@@ -684,8 +723,8 @@ def score(scored: dict, manifest: dict, prot: dict, net_json: Path, trusted: lis
         return out
     out["closure_visited"] = last.get("visited")
     # the kernel: the soundness shape and the instance
-    cmd = [str(acceptcheck_binary()), "score", prot["module"], scored["checker"], scored["sound"], scored["instance"],
-           str(manifest["claimed_count"]), str(scored["claimed_bill"])] + trusted + ["--"] + oleans
+    cmd = [str(acceptcheck_binary()), "score" if plan is None else "score-planned", prot["module"], scored["checker"],
+           scored["sound"], scored["instance"], str(manifest["claimed_count"]), str(scored["claimed_bill"])] + trusted + ["--"] + oleans
     chk = run_boxed(ws, cmd, env, mode, CHECK_TIMEOUT_S, read_extra)
     receipt["steps"].append({"step": "score", "rc": chk["rc"], "seconds": chk["seconds"], "timed_out": chk["timed_out"]})
     if chk["timed_out"]:
@@ -753,6 +792,7 @@ def policy_digest() -> str:
     h.update(allowlist_text().encode())
     h.update(json.dumps({"policy_version": POLICY_VERSION, "knowledge": KNOWLEDGE,
                          "size_budget": [SIZE_BUDGET_BASE, SIZE_BUDGET_PER_PARAM],
+                         "plan_bounds": [PLAN_PER_INPUT, PLAN_BASE, PLAN_ENTRY_BITS],
                          "general_kernel_budget_ms": GENERAL_KERNEL_BUDGET_MS,
                          "allowed_axioms": sorted(ALLOWED_AXIOMS), "trusted_prefixes": TRUSTED_PREFIXES}).encode())
     return h.hexdigest()[:16]
@@ -833,7 +873,8 @@ def scoring_preview(ws: Path, module: str, checker: str, prot: dict, net_json: P
 
 
 def compile_for_development(ws: Path, rel: str, repo: Path, model: str, network: str, claimed: int, work: Path,
-                            want_mode: str, cert: list | None = None, checker: str | None = None) -> dict:
+                            want_mode: str, cert: list | None = None, checker: str | None = None,
+                            plan: list | None = None) -> dict:
     """Compile <ws>/<rel> against the protected module of (network, claimed, certificate), in the box, with the
     workspace's own out/ on the path for its other modules. For a candidate's development, never for acceptance:
     returns {"ok", "timed_out", "module", "protected_module", "messages", "seconds"} or {"ok": False, "error"}.
@@ -850,7 +891,7 @@ def compile_for_development(ws: Path, rel: str, repo: Path, model: str, network:
         mode = box_mode(want_mode)
         lean, lp = lean_binary(), lean_path()
         net_json = export_network(repo, model, network, work)
-        prot = build_protected(net_json, claimed, work, lean, lp, mode, cert)
+        prot = build_protected(net_json, claimed, work, lean, lp, mode, cert, plan)
     except (Reject, Unsupported, Infra) as exc:
         return {"ok": False, "error": str(exc)}
     module = "Candidate." + rel[len("Candidate/"):-len(".lean")].replace("/", ".")
@@ -925,6 +966,8 @@ def main(argv=None) -> int:
     c.add_argument("--knowledge", default="minimal", choices=KNOWLEDGE_CONDITIONS)
     c.add_argument("--checker", help="a checker constant: also report the counted-language closure and the "
                                      "description size against the budget, as scoring would")
+    c.add_argument("--plan", type=Path, help="a JSON list of natural numbers: the plan of a planned checker, given to "
+                                             "the protected module as `plan`")
     p = sub.add_parser("protected")
     p.add_argument("network", type=Path)
     p.add_argument("claimed", type=int)
@@ -948,8 +991,20 @@ def main(argv=None) -> int:
         return 0 if r["status"] == "accepted" else 1
     if args.cmd == "compile":
         cert = json.loads(args.certificate.read_text()) if args.certificate else None
+        plan = None
+        if args.plan:
+            sys.path.insert(0, str(HERE))
+            try:
+                import make_protected
+            finally:
+                sys.path.pop(0)
+            try:
+                plan = make_protected.canonical_plan(json.loads(args.plan.read_text()))
+            except (ValueError, make_protected.ProtectedError) as exc:
+                print(json.dumps({"ok": False, "error": f"the plan: {exc}"}, indent=1))
+                return 1
         r = compile_for_development(args.workspace.resolve(), args.module, _repo, args.model, args.network, args.claimed,
-                                    args.work.resolve(), args.mode, cert, args.checker)
+                                    args.work.resolve(), args.mode, cert, args.checker, plan)
         print(json.dumps(r, indent=1))
         return 0 if r.get("ok") else 1
     mode = box_mode(args.mode)
