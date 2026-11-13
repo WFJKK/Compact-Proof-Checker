@@ -434,6 +434,44 @@ def test_the_development_compile_reports_errors_and_never_accepts(work, tmp_path
     assert not list((work / "receipts").glob("*Dev*"))  # a compile is not a submission
 
 
+def test_the_development_compile_previews_the_scoring_checks(work, tmp_path):
+    """With --checker, a development compile reports the counted-language closure and the description size, measured
+    as the score step measures them: the same size as a submission of the same source, and the same refusal for a
+    checker outside the counted language. Run attn-min2-ptl-1 (12 November 2026) learnt of both only from its
+    one submission, after the round's budget was spent."""
+    final = submit(SCORED, work)["scoring"]
+    ws = tmp_path / "ws"
+    (ws / "Candidate").mkdir(parents=True)
+    (ws / "Candidate" / "Dev.lean").write_text(SCORED_SOURCE)
+    base = [sys.executable, "-B", str(HERE / "accept.py"), "compile", str(ws), "Candidate/Dev.lean", "--repo", str(REPO),
+            "--work", str(work), "--model", "tests/max2_tiny", "--network", "max2_tiny-v8-s0", "--claimed", "64"]
+    r = subprocess.run(base, capture_output=True, text=True, timeout=1800)
+    assert r.returncode == 0 and "scoring_preview" not in json.loads(r.stdout)  # only when asked for
+    r = subprocess.run(base + ["--checker", "Candidate.Max2TinyScored.D"], capture_output=True, text=True, timeout=1800)
+    out = json.loads(r.stdout)
+    assert r.returncode == 0 and out["ok"] is True, out
+    p = out["scoring_preview"]
+    assert p["counted_language"] == "ok" and p["offending"] == [], p
+    assert p["description_size"] == final["description_size"] and p["size_budget"] == final["size_budget"], (p, final)
+    assert p["within_budget"] is True and p["largest_definitions"][0]["size"] > 0
+    # outside the counted language: the preview names the constants the score step would
+    bare = SCORED_SOURCE.replace(NEW_D,
+                                 "def D : Checker := fun I => countSingles I graph task "
+                                 "(if (CostM.billed (countSingles Interp.counting graph task [[0, 0]]) ⟨[], #[]⟩).isSome then allInputs task.space else allInputs task.space)")
+    bare = bare.replace("  intro w c n cost h\n  unfold numCorrect\n  exact countSingles_le ⟨w, c⟩ (allInputs task.space) [] n cost h",
+                        "  intro w c n cost h\n  unfold numCorrect\n  simp only [D, ite_self] at h\n  exact countSingles_le ⟨w, c⟩ (allInputs task.space) [] n cost h")
+    (ws / "Candidate" / "Dev.lean").write_text(bare)
+    out = json.loads(subprocess.run(base + ["--checker", "Candidate.Max2TinyScored.D"], capture_output=True, text=True,
+                                    timeout=1800).stdout)
+    p = out["scoring_preview"]
+    assert out["ok"] is True and p["counted_language"] == "refused", p
+    assert "CompactCheck.Interp.counting" in p["offending"] and "CompactCheck.CostM.billed" in p["offending"], p
+    # a name that is not the candidate's
+    out = json.loads(subprocess.run(base + ["--checker", "Mathlib.foo"], capture_output=True, text=True, timeout=1800).stdout)
+    assert "error" in out["scoring_preview"]
+    assert not list((work / "receipts").glob("*Dev*"))  # still not a submission
+
+
 def test_the_agents_pilot_proof_is_verified_and_refused_scoring_in_the_current_language(work):
     """The pilot's third submission of round 1 (20 October 2026), kept as the agent wrote it: the columns of
     M = U L E, 23 of 64 inputs for a bill of 458. It was written in the first counted language (a concrete

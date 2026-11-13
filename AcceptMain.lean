@@ -51,8 +51,10 @@ proposition (by the kernel) and lists its axioms. The last line is `{"status", "
 Walks the constants the checker uses, transitively through the candidate's own definitions (not into
 theorems, which compute nothing), and lists every other constant that is not on the allowlist; the
 protected module's `graph` and `task` are allowed, its weights and certificate are not. The last line is
-`{"status": "ok" | "refused", "offending": [...], "visited": n}`. This is the check that a scored checker
-touches numbers only through the counted primitives (docs/COUNTED.md).
+`{"status": "ok" | "refused", "offending": [...], "visited": n, "checker_constants": k, "description_size": s,
+"size_by": {...}}`. This is the check that a scored checker touches numbers only through the counted
+primitives (docs/COUNTED.md); the description size is measured as `score` measures it, so that a development
+compile can report both before a submission (`accept.py compile --checker`).
 
     acceptcheck protected <network.json> <protected module> <protected .olean>
 
@@ -481,8 +483,20 @@ def runClosure (root : Name) (allowPath : String) (prot : Name) (trusted : List 
           if !allow.contains n && n != prot ++ `graph && n != prot ++ `task then
             offending := offending.push n
   let sorted := offending.qsort Name.lt
+  -- the description size, measured as `score` measures it (the same closure and the same weights), so that a
+  -- development compile can show it before a submission
+  let comp := computationalClosure cand root
+  let mut lits : Nat := 0
+  let mut litsBy : Array (String × Json) := #[]
+  for g in comp do
+    let some ci := cand.get? g | continue
+    let w := bodyLitWeight ci
+    lits := lits + w
+    if w > 0 then litsBy := litsBy.push (g.toString, Lean.toJson w)
   jsonOut [("status", if sorted.isEmpty then "ok" else "refused"),
-    ("offending", Json.arr (sorted.map fun a => Json.str a.toString)), ("visited", Lean.toJson visited.size)]
+    ("offending", Json.arr (sorted.map fun a => Json.str a.toString)), ("visited", Lean.toJson visited.size),
+    ("checker_constants", Lean.toJson comp.size), ("description_size", Lean.toJson lits),
+    ("size_by", Json.mkObj litsBy.toList)]
   return 0
 
 /-! ## The protected module against the network file -/

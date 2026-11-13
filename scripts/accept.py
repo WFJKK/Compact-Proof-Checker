@@ -771,11 +771,74 @@ def finish(receipt: dict, work: Path, t0: float) -> dict:
     return receipt
 
 
+def candidate_imports(ws: Path, module: str) -> tuple[list[str], list[str]]:
+    """The workspace modules `module` imports, itself included, transitively (in no particular order), and the
+    other modules they import, from the sources' `import` lines."""
+    seen, others, stack = [], set(), [module]
+    while stack:
+        m = stack.pop()
+        if m in seen:
+            continue
+        seen.append(m)
+        p = ws / (m.replace(".", "/") + ".lean")
+        if not p.is_file():
+            continue
+        for line in p.read_text().splitlines():
+            g = re.match(r"^\s*import\s+(.+)$", line)
+            if not g:
+                continue
+            for name in g.group(1).split():
+                if name.startswith("Candidate."):
+                    stack.append(name)
+                else:
+                    others.add(name)
+    return seen, sorted(others)
+
+
+def scoring_preview(ws: Path, module: str, checker: str, prot: dict, net_json: Path, lean: Path, lp: list[str],
+                    mode: str) -> dict:
+    """The two scoring checks that need no kernel work, run on a development compile as the score step runs them:
+    the counted-language closure of `checker` against the allowlist in force, and its description size against
+    the budget. A preview, not a verdict: the submission's score step also has the kernel check the soundness and
+    instance theorems and times the general layer."""
+    ps = checker.split(".")
+    if len(ps) < 2 or ps[0] != "Candidate" or not all(IDENT.match(x) for x in ps):
+        return {"error": "the checker must be a constant of the candidate, such as Candidate.MyChecker.D"}
+    mods, others = candidate_imports(ws, module)
+    oleans = [str(ws / "out" / (m.replace(".", "/") + ".olean")) for m in mods]
+    oleans = [o for o in oleans if os.path.isfile(o)]
+    trusted = [prot["module"]] + [m for m in others if m != prot["module"]]
+    (ws / "tmp").mkdir(exist_ok=True)
+    allowlist = ws / "tmp" / "allowlist.txt"
+    allowlist.write_text(allowlist_text())
+    lp_all = lp + [prot["lean_path_dir"], str(ws / "out")]
+    cmd = [str(acceptcheck_binary()), "closure", checker, str(allowlist), prot["module"]] + trusted + ["--"] + oleans
+    chk = run_boxed(ws, cmd, box_env(ws, lean, lp_all), mode, CHECK_TIMEOUT_S,
+                    [str(toolchain_root(lean)), str(LEAN_PROJECT)] + lp_all)
+    last = last_json(chk["stdout"])
+    if chk["timed_out"] or chk["rc"] != 0 or last is None:
+        return {"error": "the closure check failed: " + excerpt(chk["stdout"] + chk["stderr"])}
+    extract = extraction_cost(json.loads(net_json.read_text()))
+    budget = None if extract is None else size_budget(extract)
+    size = last.get("description_size")
+    by = sorted((last.get("size_by") or {}).items(), key=lambda kv: -kv[1])
+    out = {"checker": checker,
+           "counted_language": last.get("status"), "offending": last.get("offending") or [],
+           "description_size": size, "size_budget": budget,
+           "within_budget": None if size is None or budget is None else size <= budget,
+           "largest_definitions": [{"name": k, "size": v} for k, v in by[:8]]}
+    if last.get("reason"):
+        out["reason"] = last["reason"]
+    return out
+
+
 def compile_for_development(ws: Path, rel: str, repo: Path, model: str, network: str, claimed: int, work: Path,
-                            want_mode: str, cert: list | None = None) -> dict:
+                            want_mode: str, cert: list | None = None, checker: str | None = None) -> dict:
     """Compile <ws>/<rel> against the protected module of (network, claimed, certificate), in the box, with the
     workspace's own out/ on the path for its other modules. For a candidate's development, never for acceptance:
-    returns {"ok", "timed_out", "module", "protected_module", "messages", "seconds"} or {"ok": False, "error"}."""
+    returns {"ok", "timed_out", "module", "protected_module", "messages", "seconds"} or {"ok": False, "error"}.
+    With `checker` (a constant of the compiled module or the workspace modules it imports) and a successful
+    compile, also "scoring_preview" (scoring_preview)."""
     global _repo, _work
     _repo, _work = repo, work
     if not re.match(r"^Candidate/([A-Za-z_][A-Za-z0-9_]*/)*[A-Za-z_][A-Za-z0-9_]*\.lean$", rel):
@@ -794,8 +857,15 @@ def compile_for_development(ws: Path, rel: str, repo: Path, model: str, network:
     (ws / "out").mkdir(exist_ok=True)
     res = compile_module(ws, ws, module, src, lean, lp + [prot["lean_path_dir"], str(ws / "out")], mode)
     text = (res["stdout"] + res["stderr"]).strip()
-    return {"ok": res["rc"] == 0 and not res["timed_out"], "timed_out": res["timed_out"], "module": module,
-            "protected_module": prot["module"], "messages": text, "seconds": round(res["seconds"], 1)}
+    ok = res["rc"] == 0 and not res["timed_out"]
+    out = {"ok": ok, "timed_out": res["timed_out"], "module": module,
+           "protected_module": prot["module"], "messages": text, "seconds": round(res["seconds"], 1)}
+    if checker and ok:
+        try:
+            out["scoring_preview"] = scoring_preview(ws, module, checker, prot, net_json, lean, lp, mode)
+        except (Reject, Unsupported, Infra) as exc:
+            out["scoring_preview"] = {"error": str(exc)}
+    return out
 
 
 IDENTITY_KEYS = ("commit", "toolchain", "lean_project", "policy", "acceptcheck")
@@ -853,6 +923,8 @@ def main(argv=None) -> int:
     c.add_argument("--certificate", type=Path)
     c.add_argument("--mode", default="hardened", choices=BOX_MODES)
     c.add_argument("--knowledge", default="minimal", choices=KNOWLEDGE_CONDITIONS)
+    c.add_argument("--checker", help="a checker constant: also report the counted-language closure and the "
+                                     "description size against the budget, as scoring would")
     p = sub.add_parser("protected")
     p.add_argument("network", type=Path)
     p.add_argument("claimed", type=int)
@@ -877,7 +949,7 @@ def main(argv=None) -> int:
     if args.cmd == "compile":
         cert = json.loads(args.certificate.read_text()) if args.certificate else None
         r = compile_for_development(args.workspace.resolve(), args.module, _repo, args.model, args.network, args.claimed,
-                                    args.work.resolve(), args.mode, cert)
+                                    args.work.resolve(), args.mode, cert, args.checker)
         print(json.dumps(r, indent=1))
         return 0 if r.get("ok") else 1
     mode = box_mode(args.mode)
