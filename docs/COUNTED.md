@@ -138,6 +138,15 @@ candidate code). Proofs about `D` use `run_bind`, `run_pure`, the operations' sp
 (`single_spec`, `interval_spec`) and `exec_of_billed`, which turns the instance into the hypothesis of
 soundness, so the target follows inside the candidate.
 
+Since 13 November 2026 the service asks for both in the replay that verifies the candidate,
+`acceptcheck check-score`, instead of a second replay with `acceptcheck score`: the general layer first and
+timed, then the rest, then the target's challenge, then these two (what is accepted and what is scored are
+unchanged; the separate commands remain). And a submission's modules are compiled without the kernel's check
+of each declaration (`debug.skipKernelTC`): the replay checks every constant of the candidate, so a false
+`decide +kernel` fact compiles and is then rejected there (`test_a_submission_compiles_without_the_kernel_and_the_replay_is_the_check`).
+On run attn-min2-ptl-1's 672-input proof the old path took 540 s to compile (the instance's decided facts
+checked by the kernel as Lean added them), 505 s to check and 440 s to score: the same kernel work three times.
+
 ## Why the reported cost is the cost
 
 Proving that a checker's count is right says nothing about its bill, so the bill is never reported by the

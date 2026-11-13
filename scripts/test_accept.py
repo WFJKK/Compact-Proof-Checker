@@ -262,7 +262,75 @@ def test_the_scored_proof_is_verified_and_scored(work):
     assert s["length"] == s["bill"] + s["extract"] + s["read"]
     assert s["description_size"] <= s["size_budget"] and s["general_kernel_ms"] <= s["general_kernel_budget_ms"]
     assert set(s["axioms"]) <= {"propext", "Classical.choice", "Quot.sound"}
-    assert [x["step"] for x in r["steps"]] == ["protected", "compile", "kernel", "closure", "score"]
+    # one replay verifies and scores (check-score), after the closure check, which needs none
+    assert [x["step"] for x in r["steps"]] == ["protected", "compile", "closure", "kernel"]
+    assert [x["scores"] for x in r["steps"] if x["step"] == "kernel"] == [True]
+    assert all(x["kernel"] is False for x in r["steps"] if x["step"] == "compile")
+
+
+FALSE_FACT = ("namespace Candidate.False\n\ntheorem five : 2 + 2 = 5 := by decide +kernel\n\n"
+              "end Candidate.False\n")
+
+
+def test_a_submission_compiles_without_the_kernel_and_the_replay_is_the_check(work, tmp_path):
+    """A false fact decided by the kernel: a development compile refuses it (the kernel checks there), a
+    submission's compile does not check it (debug.skipKernelTC), and the replay rejects the submission. So the
+    one check that counts is acceptcheck's, as before; the compile only stopped doing it twice."""
+    ws = tmp_path / "ws"
+    (ws / "Candidate").mkdir(parents=True)
+    (ws / "Candidate" / "False.lean").write_text(FALSE_FACT)
+    cmd = [sys.executable, "-B", str(HERE / "accept.py"), "compile", str(ws), "Candidate/False.lean", "--repo", str(REPO),
+           "--work", str(work), "--model", "tests/max2_tiny", "--network", "max2_tiny-v8-s0", "--claimed", "64"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    out = json.loads(r.stdout)
+    assert r.returncode == 1 and out["ok"] is False and "error" in out["messages"].lower(), out
+    d = _with_module(tmp_path, "false-fact", "Candidate/False.lean", FALSE_FACT)
+    m = json.loads((d / "manifest.json").read_text())
+    m.update(kind="auxiliary", theorem="Candidate.False.five")
+    (d / "manifest.json").write_text(json.dumps(m))
+    r = submit(d, work)
+    compiled = [x for x in r["steps"] if x["step"] == "compile" and x["module"] == "Candidate.False"]
+    assert compiled and compiled[0]["rc"] == 0 and compiled[0]["kernel"] is False
+    assert r["status"] == "rejected" and "the kernel rejects the candidate" in r["reason"], r["reason"]
+
+
+def test_one_replay_scores_as_check_then_score_did(work):
+    """check-score's verdicts and measures on the scored example are check's and score's, run apart."""
+    r = submit(SCORED, work)
+    ws = max((work / "submissions").glob(f"{r['candidate_id']}-*"), key=lambda p: p.stat().st_mtime)
+    oleans = sorted(str(p) for p in (ws / "out" / "Candidate").rglob("*.olean"))
+    prot = next(x["module"] for x in r["steps"] if x["step"] == "protected")
+    m = json.loads((SCORED / "manifest.json").read_text())
+    sc = m["scored"]
+    accept = _accept_module()
+    accept._repo, accept._work = REPO, work
+    lean, lp = accept.lean_binary(), accept.lean_path()
+    lp_all = lp + [str(work / "protected" / prot.split(".", 1)[1] / "out")]
+    env = accept.box_env(ws, lean, lp_all)
+    source = (SCORED / "Candidate" / "Max2TinyScored.lean").read_text()
+    trusted = [prot] + sorted({line.split()[1] for line in source.splitlines() if line.startswith("import ")
+                               and not line.split()[1].startswith(("Candidate.", "Protected."))})
+
+    def run(*args):
+        chk = accept.run_boxed(ws, [str(accept.acceptcheck_binary()), *args, *trusted, "--", *oleans], env,
+                               accept.box_mode("hardened"), 1800, [str(accept.toolchain_root(lean)), str(PROJECT)] + lp_all)
+        return accept.last_json(chk["stdout"])
+
+    check = run("check", f"{prot}.Target", m["theorem"])
+    score = run("score", prot, sc["checker"], sc["sound"], sc["instance"], str(m["claimed_count"]), str(sc["claimed_bill"]))
+    both = run("check-score", f"{prot}.Target", m["theorem"], prot, sc["checker"], sc["sound"], sc["instance"],
+               str(m["claimed_count"]), str(sc["claimed_bill"]))
+    assert check["status"] == both["status"] == "accepted" and check["axioms"] == both["axioms"]
+    assert check["replayed"] == both["replayed"]
+    s = both["scoring"]
+    assert s["status"] == score["status"] == "accepted" and s["axioms"] == score["axioms"]
+    for part, key in (("general", "description_size"), ("general", "constants"), ("general", "checker_constants"), ("rest", "constants")):
+        assert s[part][key] == score[part][key], (part, key)
+    # a wrong bill: verified, scoring refused with score's reason
+    wrong = run("check-score", f"{prot}.Target", m["theorem"], prot, sc["checker"], sc["sound"], sc["instance"],
+                str(m["claimed_count"]), str(sc["claimed_bill"] + 1))
+    assert wrong["status"] == "accepted" and wrong["scoring"]["status"] == "rejected"
+    assert "Challenge.instance" in wrong["scoring"]["reason"]
 
 
 def test_a_wrong_bill_is_refused_scoring(work, tmp_path):

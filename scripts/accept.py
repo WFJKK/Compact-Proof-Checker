@@ -37,13 +37,19 @@ A scored submission (docs/COUNTED.md) adds to its manifest
     "scored": {"checker": "Candidate.X.D", "sound": "Candidate.X.D_sound", "instance": "Candidate.X.D_instance",
                "certificate": [...numbers...], "claimed_bill": 12345}
 
-and, once verified as above, goes through the scored path: the certificate becomes the protected module's
-`cert`; `acceptcheck closure` checks that the checker touches numbers only through the counted primitives
-(accept/allowlist.txt); `acceptcheck score` has the kernel accept the soundness theorem at the fixed shape and
-the instance `CostM.billed D ⟨weights, cert⟩ = some (claimed_count, claimed_bill)`, and measures the general
-layer (the checker's description size, kernel time), which the policy budgets below bound. The receipt's `scoring` block says
-whether the submission is scored and gives the length in cost-v3 units: the bill, plus `extract` (one per
-weight entry) and `read` (one per certificate number). A submission refused scoring stays verified.
+and goes through the scored path: the certificate becomes the protected module's `cert`; before the kernel,
+`acceptcheck closure` checks that the checker touches numbers only through the counted primitives
+(accept/allowlist.txt); then `acceptcheck check-score`, in the one replay that verifies the candidate, has the
+kernel accept the soundness theorem at the fixed shape and the instance `CostM.billed D ⟨weights, cert⟩ =
+some (claimed_count, claimed_bill)`, and measures the general layer (the checker's description size, kernel
+time), which the policy budgets below bound. The receipt's `scoring` block says whether the submission is
+scored and gives the length in cost-v3 units: the bill, plus `extract` (one per weight entry) and `read` (one
+per certificate number). A submission refused scoring stays verified.
+
+A submission's modules are compiled without the kernel's check of each declaration (`debug.skipKernelTC`):
+acceptcheck replays every constant of the candidate through the kernel, and that replay is the check that
+counts; checking at the compile as well only did the same work twice (three times for a scored proof, before
+check-score). A development compile (`compile`) keeps the kernel's check, so its errors show where they are.
 
 A manifest with "kind": "auxiliary" submits a lemma instead of a proof of Target: `theorem` may have any
 statement; it is compiled, replayed and axiom-checked the same way (`acceptcheck lemma`), and accepted with
@@ -384,8 +390,10 @@ def box_env(ws: Path, lean: Path, lp: list[str]) -> dict:
 
 
 def compile_module(ws: Path, root: Path, module: str, src: Path, lean: Path, lp: list[str], mode: str,
-                   timeout_s: float = COMPILE_TIMEOUT_S) -> dict:
-    """Compile one module whose source is src (module name relative to root) into ws/out."""
+                   timeout_s: float = COMPILE_TIMEOUT_S, kernel: bool = True) -> dict:
+    """Compile one module whose source is src (module name relative to root) into ws/out. kernel=False skips
+    the kernel's check of each declaration as Lean adds it (debug.skipKernelTC): only for a submission, whose
+    every constant acceptcheck replays through the kernel afterwards, the check that counts."""
     out = ws / "out" / (module.replace(".", "/") + ".olean")
     out.parent.mkdir(parents=True, exist_ok=True)
     env = box_env(ws, lean, lp)
@@ -393,7 +401,8 @@ def compile_module(ws: Path, root: Path, module: str, src: Path, lean: Path, lp:
     # task, and a module of many theorems (an instance split into one decided fact per input) makes Lean start
     # threads whose stacks reserve more address space than any limit the box can set (64 GB was not enough for
     # 64 facts; the process reserved about 77 GB unlimited). Sequential elaboration builds the same constants.
-    cmd = [str(lean), "-DElab.async=false", "-R", str(root), "-o", str(out), str(src)]
+    cmd = [str(lean), "-DElab.async=false"] + ([] if kernel else ["-Ddebug.skipKernelTC=true"]) + \
+        ["-R", str(root), "-o", str(out), str(src)]
     res = run_boxed(ws, cmd, env, mode, timeout_s, [str(toolchain_root(lean)), str(LEAN_PROJECT)] + lp)
     res["module"] = module
     res["olean"] = str(out)
@@ -634,24 +643,35 @@ def submit(cdir: Path, repo: Path, work: Path, want_mode: str) -> dict:
         lp_all = lp + [prot["lean_path_dir"]]
         oleans = []
         for m in order:
-            res = compile_module(ws, ws, m, ws / (m.replace(".", "/") + ".lean"), lean, lp_all, mode)
+            # without the kernel's check here: acceptcheck replays every constant through the kernel below, and an
+            # instance of many decided facts was checked three times before (compile, check, score)
+            res = compile_module(ws, ws, m, ws / (m.replace(".", "/") + ".lean"), lean, lp_all, mode, kernel=False)
             receipt["steps"].append({"step": "compile", "module": m, "rc": res["rc"], "seconds": res["seconds"],
-                                     "timed_out": res["timed_out"]})
+                                     "timed_out": res["timed_out"], "kernel": False})
             if res["timed_out"]:
                 receipt.update(status="timeout", reason=f"compiling {m} exceeded {COMPILE_TIMEOUT_S} s")
                 return finish(receipt, work, t0)
             if res["rc"] != 0:
                 raise Reject(f"{m} does not compile: {excerpt(res['stdout'] + res['stderr'])}")
             oleans.append(res["olean"])
-        # the kernel
+        # the kernel: one replay of every constant, which verifies and, for a scored proof, scores
         trusted = [prot["module"]] + sorted({d for ds in deps.values() for d in ds if not d.startswith("Candidate.")})
         env = box_env(ws, lean, lp_all)
+        scoring = None  # a scored proof: what scoring finds before the kernel (score_before_kernel)
         if manifest["kind"] == "auxiliary":
             cmd = [str(acceptcheck_binary()), "lemma", manifest["theorem"]] + trusted + ["--"] + oleans
         else:
-            cmd = [str(acceptcheck_binary()), "check", prot["module"] + ".Target", manifest["theorem"]] + trusted + ["--"] + oleans
+            if scored:
+                scoring = score_before_kernel(scored, prot, net_json, trusted, oleans, ws, env, mode, lean, lp_all, receipt)
+            if scoring is not None and scoring["status"] is None:  # verified and scored in one replay
+                cmd = [str(acceptcheck_binary()), "check-score" if scored.get("plan") is None else "check-score-planned",
+                       prot["module"] + ".Target", manifest["theorem"], prot["module"], scored["checker"], scored["sound"],
+                       scored["instance"], str(manifest["claimed_count"]), str(scored["claimed_bill"])] + trusted + ["--"] + oleans
+            else:
+                cmd = [str(acceptcheck_binary()), "check", prot["module"] + ".Target", manifest["theorem"]] + trusted + ["--"] + oleans
         chk = run_boxed(ws, cmd, env, mode, CHECK_TIMEOUT_S, [str(toolchain_root(lean)), str(LEAN_PROJECT)] + lp_all)
-        receipt["steps"].append({"step": "kernel", "rc": chk["rc"], "seconds": chk["seconds"], "timed_out": chk["timed_out"]})
+        receipt["steps"].append({"step": "kernel", "rc": chk["rc"], "seconds": chk["seconds"], "timed_out": chk["timed_out"],
+                                 "scores": cmd[1].startswith("check-score")})
         if chk["timed_out"]:
             receipt.update(status="timeout", reason=f"the kernel check exceeded {CHECK_TIMEOUT_S} s")
             return finish(receipt, work, t0)
@@ -671,7 +691,7 @@ def submit(cdir: Path, repo: Path, work: Path, want_mode: str) -> dict:
         receipt.update(status="accepted", certified_count=manifest["claimed_count"],
                        replayed_constants=last.get("replayed"))
         if scored:
-            receipt["scoring"] = score(scored, manifest, prot, net_json, trusted, oleans, ws, env, mode, lean, lp_all, receipt)
+            receipt["scoring"] = scoring if scoring["status"] is not None else score_after_kernel(scored, scoring, last.get("scoring"))
             if receipt["scoring"]["status"] == "scored":
                 receipt.update(score_eligible=True, execution_assurance=ASSURANCE)
     except Reject as exc:
@@ -683,10 +703,12 @@ def submit(cdir: Path, repo: Path, work: Path, want_mode: str) -> dict:
     return finish(receipt, work, t0)
 
 
-def score(scored: dict, manifest: dict, prot: dict, net_json: Path, trusted: list[str], oleans: list[str], ws: Path,
-          env: dict, mode: str, lean: Path, lp_all: list[str], receipt: dict) -> dict:
-    """The scored path, after verification: the closure check, the kernel's two challenges, the budgets, the
-    length. Returns the receipt's `scoring` block; never raises for the candidate's faults."""
+def score_before_kernel(scored: dict, prot: dict, net_json: Path, trusted: list[str], oleans: list[str], ws: Path,
+                        env: dict, mode: str, lean: Path, lp_all: list[str], receipt: dict) -> dict:
+    """The scored path's checks that need no kernel: the network's extraction cost, the plan's bounds and the
+    closure check (the checker touches numbers only through the counted primitives). Returns the receipt's
+    `scoring` block, refused, or with status None when the kernel's part (score_after_kernel) is to follow.
+    Never raises for the candidate's faults."""
     net = json.loads(net_json.read_text())
     extract = extraction_cost(net)
     read = len(scored["certificate"])
@@ -708,7 +730,6 @@ def score(scored: dict, manifest: dict, prot: dict, net_json: Path, trusted: lis
             out.update(status="refused", reason=why)
             return out
     read_extra = [str(toolchain_root(lean)), str(LEAN_PROJECT)] + lp_all
-    # the checker touches numbers only through the counted primitives
     allowlist = ws / "allowlist.txt"  # the list in force, written where the box can read it
     allowlist.write_text(allowlist_text())
     cmd = [str(acceptcheck_binary()), "closure", scored["checker"], str(allowlist), prot["module"]] + trusted + ["--"] + oleans
@@ -722,17 +743,16 @@ def score(scored: dict, manifest: dict, prot: dict, net_json: Path, trusted: lis
                    + ", ".join(last.get("offending") or []) + (f" ({last['reason']})" if last.get("reason") else ""))
         return out
     out["closure_visited"] = last.get("visited")
-    # the kernel: the soundness shape and the instance
-    cmd = [str(acceptcheck_binary()), "score" if plan is None else "score-planned", prot["module"], scored["checker"],
-           scored["sound"], scored["instance"], str(manifest["claimed_count"]), str(scored["claimed_bill"])] + trusted + ["--"] + oleans
-    chk = run_boxed(ws, cmd, env, mode, CHECK_TIMEOUT_S, read_extra)
-    receipt["steps"].append({"step": "score", "rc": chk["rc"], "seconds": chk["seconds"], "timed_out": chk["timed_out"]})
-    if chk["timed_out"]:
-        out.update(status="timeout", reason=f"the scored kernel check exceeded {CHECK_TIMEOUT_S} s")
-        return out
-    last = last_json(chk["stdout"])
-    if chk["rc"] != 0 or last is None:
-        raise Infra(f"acceptcheck score failed: {(chk['stdout'] + chk['stderr'])[-1500:]}")
+    return out
+
+
+def score_after_kernel(scored: dict, out: dict, last: dict | None) -> dict:
+    """The scored path's kernel part, from the `scoring` that `acceptcheck check-score` reported with the one
+    replay that verified the candidate: the soundness shape and the instance, their axioms, the description
+    size and the general layer's kernel time against their budgets, and the length."""
+    out = dict(out)
+    if not isinstance(last, dict):
+        raise Infra("acceptcheck check-score reported no scoring")
     if last.get("status") != "accepted":
         out.update(status="refused", reason=last.get("reason") or "the kernel rejected the scored submission")
         return out
@@ -753,7 +773,7 @@ def score(scored: dict, manifest: dict, prot: dict, net_json: Path, trusted: lis
         out.update(status="refused", reason=f"replaying the general layer took {out['general_kernel_ms']} ms, over the budget {GENERAL_KERNEL_BUDGET_MS} ms")
         return out
     # the length, in cost-v3 units
-    out.update(status="scored", bill=scored["claimed_bill"], length=scored["claimed_bill"] + extract + read)
+    out.update(status="scored", bill=scored["claimed_bill"], length=scored["claimed_bill"] + out["extract"] + out["read"])
     return out
 
 

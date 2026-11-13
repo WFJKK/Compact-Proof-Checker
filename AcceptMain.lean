@@ -46,6 +46,18 @@ computational closure (its definitions, through definitions only), bodies, no ex
 `{"status": "accepted" | "rejected", "reason": ..., "axioms": [...], "replayed": n,
   "general": {"constants": k, "literals": l, "kernel_ms": ms}, "rest": {...}, "challenge_ms": ms}`.
 
+    acceptcheck check-score <target const> <candidate const> <protected module> <checker> <sound> <instance>
+                            <claimed count> <claimed bill> <trusted modules...> -- <candidate .olean files...>
+    acceptcheck check-score-planned <the same arguments>
+
+`check` and `score` (or `score-planned`) with one replay instead of two (13 November 2026; what is accepted and
+what is scored are unchanged): the general layer is replayed first and timed, then the rest, and the target's
+challenge decides acceptance as in `check`; then the two scoring challenges and the measures, as in `score`.
+What scoring needs before any replay (the protected constants, the three names, what the general layer refers
+to) is looked at first; when it fails, scoring is refused with `score`'s reason and the candidate is replayed in
+one piece. The last line is `check`'s, with `"scoring"`: `score`'s object (status accepted or rejected). The
+service (`accept.py submit`) uses it for every scored proof whose closure check passed.
+
     acceptcheck lemma <theorem> <trusted modules...> -- <candidate .olean files...>
 
 An auxiliary submission: after the same replay, checks that `<theorem>` is a theorem whose statement is a
@@ -442,6 +454,100 @@ def runScore (prot D sound inst : Name) (n bill : Nat) (trusted : List Name) (ol
     ("challenge_ms", Lean.toJson challengeMs)]
   return 0
 
+/-! ## Verification and scoring in one replay
+
+`check` and then `score` replayed every constant of a scored candidate through the kernel twice, in two
+processes. `check-score` does both with one replay: the general layer first, timed, then the rest, as `score`
+does; the target's challenge then decides acceptance exactly as in `check`, and the scoring challenges and
+measures are `score`'s. What scoring needs before any replay (the protected constants, the three names, what
+the general layer refers to) is looked at first: when it fails, scoring is refused with `score`'s reason and the
+candidate is replayed in one piece, as `check` does. The output is `check`'s, with `scoring`: `score`'s output
+(its `status` accepted or rejected). -/
+
+/-- Why scoring cannot go ahead, before any replay; none when it can. -/
+def scorePrecheck (kenv : Kernel.Environment) (cs : Std.HashMap Name ConstantInfo) (prot D sound inst : Name)
+    (planned : Bool) : Option String := Id.run do
+  for c in [prot ++ `graph, prot ++ `weights, prot ++ `task, prot ++ `cert] ++ (if planned then [prot ++ `plan] else []) do
+    if (kenv.find? c).isNone then
+      return some s!"the protected module has no constant {c}"
+  for c in [D, sound, inst] do
+    if !cs.contains c then return some s!"the candidate has no constant {c}"
+  for g in dependencyClosure cs [D, sound] do
+    let some ci := cs.get? g | continue
+    for m in ci.getUsedConstantsAsSet.toList do
+      if !generalMayUse prot m then
+        return some s!"the general layer ({g}) uses the protected constant {m}; only {prot}.graph and {prot}.task may appear outside the instance"
+  return none
+
+def runCheckScore (target cand prot D sound inst : Name) (n bill : Nat) (trusted : List Name) (oleans : List String)
+    (planned : Bool := false) : IO UInt32 := do
+  initSearchPath (← findSysroot)
+  let env ← importModules (trusted.toArray.map fun m => { module := m : Import }) {} (trustLevel := 0)
+  let kenv := env.toKernelEnv
+  if kenv.find? target |>.isNone then
+    return ← rejected s!"the target {target} is not a constant of the trusted modules"
+  let cs ← match ← candidateConstants kenv oleans with
+    | .ok cs => pure cs
+    | .error e => return ← rejected e
+  let refusal := scorePrecheck kenv cs prot D sound inst planned
+  -- the one replay: the general layer first, timed, then the rest (all of it at once when scoring is refused)
+  let general : NameSet := if refusal.isSome then {} else dependencyClosure cs [D, sound]
+  let generalMap : Std.HashMap Name ConstantInfo := general.foldl (fun m g => match cs.get? g with
+    | some ci => m.insert g ci | none => m) {}
+  let restMap : Std.HashMap Name ConstantInfo := cs.fold (fun m k v => if general.contains k then m else m.insert k v) {}
+  let (kenv, generalMs) ← match ← replayTimed kenv generalMap with
+    | .ok r => pure r
+    | .error e => return ← rejected e
+  let (kenv, restMs) ← match ← replayTimed kenv restMap with
+    | .ok r => pure r
+    | .error e => return ← rejected e
+  -- acceptance, as in `check`
+  if (kenv.find? cand).isNone then
+    return ← rejected s!"the candidate has no constant {cand}"
+  let decl := Declaration.thmDecl {
+    name := `Challenge.proof, levelParams := [], type := mkConst target, value := mkConst cand }
+  let kenv ← match kenv.addDeclCore 0 0 decl (cancelTk? := none) with
+    | .error e =>
+      let msg ← (e.toMessageData {}).toString
+      return ← rejected s!"the kernel rejects Challenge.proof : {target} := {cand}: {msg}"
+    | .ok k => pure k
+  let axioms := axiomsOf kenv `Challenge.proof
+  -- scoring, as in `score`
+  let refused (why : String) : Json := Json.mkObj [("status", "rejected"), ("reason", why)]
+  let scoring ← match refusal with
+    | some why => pure (refused why)
+    | none => do
+      let comp := computationalClosure cs D
+      let mut lits : Nat := 0
+      let mut litsBy : Array (String × Json) := #[]
+      for g in comp do
+        let some ci := cs.get? g | continue
+        let w := bodyLitWeight ci
+        lits := lits + w
+        if w > 0 then litsBy := litsBy.push (g.toString, Lean.toJson w)
+      let t0 ← IO.monoMsNow
+      let soundT := if planned then soundTypePlanned D (prot ++ `graph) (prot ++ `task) else soundType D (prot ++ `graph) (prot ++ `task)
+      let instT := if planned then instanceTypePlanned D (prot ++ `weights) (prot ++ `cert) (prot ++ `plan) n bill
+        else instanceType D (prot ++ `weights) (prot ++ `cert) n bill
+      match ← challenge kenv `Challenge.sound soundT sound with
+      | .error e => pure (refused e)
+      | .ok kenv1 =>
+        match ← challenge kenv1 `Challenge.instance instT inst with
+        | .error e => pure (refused e)
+        | .ok kenv2 =>
+          let challengeMs := (← IO.monoMsNow) - t0
+          let axs := (axiomsOf kenv2 `Challenge.sound ++ axiomsOf kenv2 `Challenge.instance).toList.eraseDups.toArray.qsort Name.lt
+          pure (Json.mkObj [("status", "accepted"), ("reason", Json.null),
+            ("axioms", Json.arr (axs.map fun a => Json.str a.toString)), ("replayed", Lean.toJson cs.size),
+            ("general", Json.mkObj [("constants", Lean.toJson general.size), ("checker_constants", Lean.toJson comp.size),
+              ("description_size", Lean.toJson lits), ("size_by", Json.mkObj litsBy.toList), ("kernel_ms", Lean.toJson generalMs)]),
+            ("rest", Json.mkObj [("constants", Lean.toJson restMap.size), ("kernel_ms", Lean.toJson restMs)]),
+            ("challenge_ms", Lean.toJson challengeMs)])
+  jsonOut [("status", "accepted"), ("reason", Json.null),
+    ("axioms", Json.arr (axioms.map fun a => Json.str a.toString)), ("replayed", Lean.toJson cs.size),
+    ("scoring", scoring)]
+  return 0
+
 /-! ## The description size of a checker, for calibration and for a candidate's own development -/
 
 def runSize (D : Name) (trusted : List Name) (oleans : List String) : IO UInt32 := do
@@ -593,10 +699,26 @@ def usage : String :=
   "usage: acceptcheck check <target> <candidate const> <trusted modules...> -- <candidate oleans...>\n" ++
   "       acceptcheck score <protected module> <checker> <sound> <instance> <count> <bill> <trusted modules...> -- <candidate oleans...>\n" ++
   "       acceptcheck score-planned <protected module> <checker> <sound> <instance> <count> <bill> <trusted modules...> -- <candidate oleans...>\n" ++
+  "       acceptcheck check-score <target> <candidate const> <protected module> <checker> <sound> <instance> <count> <bill> <trusted modules...> -- <candidate oleans...>\n" ++
+  "       acceptcheck check-score-planned <target> <candidate const> <protected module> <checker> <sound> <instance> <count> <bill> <trusted modules...> -- <candidate oleans...>\n" ++
   "       acceptcheck lemma <theorem> <trusted modules...> -- <candidate oleans...>\n" ++
   "       acceptcheck size <checker const> <trusted modules...> -- <candidate oleans...>\n" ++
   "       acceptcheck closure <checker const> <allowlist> <protected module> <trusted modules...> -- <candidate oleans...>\n" ++
   "       acceptcheck protected <network.json> <protected module> <protected olean>"
+
+def checkScore (target cand prot D sound inst n bill : String) (rest : List String) (planned : Bool) : IO UInt32 := do
+  let (trusted, oleans) := rest.span (· != "--")
+  let oleans := oleans.drop 1
+  match n.toNat?, bill.toNat? with
+  | some n, some bill =>
+    if oleans.isEmpty then
+      IO.eprintln usage
+      return 2
+    Accept.runCheckScore target.toName cand.toName prot.toName D.toName sound.toName inst.toName n bill
+      (trusted.map String.toName) oleans (planned := planned)
+  | _, _ =>
+    IO.eprintln usage
+    return 2
 
 def main (args : List String) : IO UInt32 := do
   match args with
@@ -631,6 +753,10 @@ def main (args : List String) : IO UInt32 := do
     | _, _ =>
       IO.eprintln usage
       return 2
+  | "check-score" :: target :: cand :: prot :: D :: sound :: inst :: n :: bill :: rest =>
+    checkScore target cand prot D sound inst n bill rest false
+  | "check-score-planned" :: target :: cand :: prot :: D :: sound :: inst :: n :: bill :: rest =>
+    checkScore target cand prot D sound inst n bill rest true
   | "size" :: D :: rest =>
     let (trusted, oleans) := rest.span (· != "--")
     let oleans := oleans.drop 1
