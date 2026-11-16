@@ -47,7 +47,8 @@ def work(tmp_path_factory):
     return tmp_path_factory.mktemp("accept-work")
 
 
-SMALL_BUDGET = {"ACCEPT_SIZE_BUDGET_BASE": "512", "ACCEPT_SIZE_BUDGET_PER_PARAM": "1"}  # 592 on the tiny network
+SMALL_BUDGET = {"ACCEPT_SIZE_BUDGET_BASE": "512", "ACCEPT_SIZE_BUDGET_PER_PARAM": "1",
+                "ACCEPT_SIZE_BUDGET_SHARE": "0"}  # 592 on the tiny network
 
 
 def copy_bound(nums: list[int]) -> int:
@@ -435,7 +436,7 @@ def test_a_checker_may_compare_a_list_with_the_empty_list(work, tmp_path):
     assert r["status"] == "accepted", r["reason"]
     s = r["scoring"]
     assert s["status"] == "scored", s
-    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v10"
+    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v11"
 
 
 # ---- planned checkers (policy v9) ---------------------------------------------------------------------------
@@ -471,7 +472,7 @@ def test_a_planned_checker_is_scored_and_its_plan_is_free(work):
     assert s["status"] == "scored", s
     assert s["bill"] == 60 * 63 and s["read"] == 0 and s["length"] == s["bill"] + s["extract"] + s["read"]
     assert s["plan_entries"] == 64 and s["description_size"] <= s["size_budget"]
-    assert r["policy_version"] == "open-lane-policy-v10"
+    assert r["policy_version"] == "open-lane-policy-v11"
 
 
 def test_a_planned_soundness_proof_must_hold_for_every_plan(work, tmp_path):
@@ -880,11 +881,28 @@ def test_the_ported_column_proof_is_scored_under_language_v4(work, tmp_path):
     assert r["score_eligible"] is True
 
 
+def test_weight_bits_counts_the_sign_and_the_significant_bits_of_each_weight():
+    """weight_bits by hand: a weight's trailing zeros (the tensor's common exponent) carry nothing, its sign one
+    bit, a zero weight one bit; the exporter's #const weights are not parameters. size_budget (policy v11) is
+    v10's 8192 + 4 E, raised where it is lower to half of weight_bits, the share raising it to at most 16,384."""
+    sys.path.insert(0, str(HERE))
+    import accept
+    sys.path.pop(0)
+    net = {"weights": [{"name": "W", "ints": [0, 1, -1, 2, 12, -40, 2 ** 40]}, {"name": "#const0", "ints": [12345]}]}
+    assert accept.weight_bits(net) == 1 + 2 + 2 + 2 + 3 + 4 + 2
+    assert accept.size_budget(1296, 31127) == 15563  # attn-min2-v64d8-s1: half of weight_bits
+    assert accept.size_budget(544, 13052) == 8192 + 4 * 544  # attn-max4-v16-s1: the base
+    assert accept.size_budget(1500, 40000) == 16384  # the cap
+    assert accept.size_budget(8256, 198333) == 8192 + 4 * 8256  # from E = 2,048 on, v10's budget
+
+
 def test_the_default_size_budget_is_below_a_copy_of_the_weights_on_every_zoo_setting():
-    """The policy's arithmetic, with no Lean: for one network of every size setting of every model in the
-    pipeline's zoo, the bits of its weights as the exporter writes them (integers over the tensor's common
-    power-of-two exponent: the least any encoding measures, one unit per bit) exceed 8192 + 4 E. The tiny
-    test network (E = 80) is the exception the other size tests work around with SMALL_BUDGET."""
+    """The policy's arithmetic, with no Lean, for one network of every size setting of every model in the
+    pipeline's zoo, its weights as the exporter writes them (integers over the tensor's common power-of-two
+    exponent). A copy holds at least weight_bits (each weight's sign and significant bits; at most the
+    exporter's bits plus a sign per weight), which is over the default budget everywhere, and at least twice
+    it where the share decides it. No budget is below v10's 8192 + 4 E, and from E = 2,048 on none differs.
+    The tiny test network (E = 80) is the exception the other size tests work around with SMALL_BUDGET."""
     sys.path.insert(0, str(HERE))
     import accept
     sys.path.pop(0)
@@ -899,32 +917,37 @@ def test_the_default_size_budget_is_below_a_copy_of_the_weights_on_every_zoo_set
                 continue
             settings.add(n["setting"])
             z = np.load(manifest.parent / n["weights"])
-            bits = E = 0
+            weights = []
             for key in z:
                 arr = np.asarray(z[key])
                 if arr.dtype.kind != "f":
                     continue
                 fr = [Fraction(float(v)) for v in arr.reshape(-1).astype(np.float64)]
                 den = max([f.denominator for f in fr] + [1])
-                ints = [int(f * den) for f in fr]
-                bits += copy_bound(ints)
-                E += len(ints)
-            budget = accept.SIZE_BUDGET_BASE + accept.SIZE_BUDGET_PER_PARAM * E
-            seen.append((manifest.parent.parent.name, n["setting"], E, bits, budget))
-            assert bits > budget, (manifest.parent.parent.name, n["setting"], E, bits, budget)
+                weights.append({"name": key, "ints": [int(f * den) for f in fr]})
+            E = sum(len(w["ints"]) for w in weights)
+            bits = accept.weight_bits({"weights": weights})
+            budget, v10 = accept.size_budget(E, bits), 8192 + 4 * E
+            row = (manifest.parent.parent.name, n["setting"], E, bits, budget)
+            seen.append(row)
+            assert bits <= sum(copy_bound(w["ints"]) for w in weights) + E, row
+            assert budget >= v10 and (E < 2048 or budget == v10), row
+            assert bits > budget and (budget == v10 or bits >= 2 * budget), row
     assert len(seen) >= 6, seen
 
 
 def test_a_copy_of_the_weights_is_refused_under_the_default_policy_on_a_real_network(work, tmp_path):
-    """max2 v64 (E = 1,088, 23 to 35 bits per weight): a numeral copy of the weights in the general layer
-    measures above the default budget 8192 + 4 E = 12,544 and is refused scoring, with no test hook. The
-    checker certifies nothing (count 0, so the kernel work is small); the proof stays verified."""
+    """max2 v64 (E = 1,088): a numeral table of the weights' significant bits alone (each integer without its
+    trailing zeros, with no sign and no exponent, so less than any usable copy) in the general layer measures
+    above the default budget, half of weight_bits = 13,010 (v10's 8192 + 4 E is 12,544), and is refused
+    scoring, with no test hook. The checker certifies nothing (count 0, so the kernel work is small); the proof
+    stays verified."""
     sys.path.insert(0, str(HERE))
     import accept
     sys.path.pop(0)
     accept._repo = REPO
     net = json.loads(accept.export_network(REPO, "models/max2", "max2-v64-s0", work).read_text())
-    nums = [abs(v) for w in net["weights"] for v in w["ints"]]
+    nums = [abs(v) >> ((abs(v) & -abs(v)).bit_length() - 1) if v else 0 for w in net["weights"] for v in w["ints"]]
     assert len(nums) == 1088
     src = "\n".join([
         "import Protected.N_max2_v64_s0_c0", "import CompactCheck.Soundness", "import CompactCheck.CountedOps", "",
@@ -953,7 +976,8 @@ def test_a_copy_of_the_weights_is_refused_under_the_default_policy_on_a_real_net
     assert r["status"] == "accepted" and r["certified_count"] == 0, r["reason"]
     s = r["scoring"]
     assert s["status"] == "refused" and "description size" in s["reason"], s
-    assert s["size_budget"] == 8192 + 4 * 1088 and s["description_size"] >= copy_bound(nums) > s["size_budget"], s
+    assert s["weight_bits"] == accept.weight_bits(net) and s["size_budget"] == accept.size_budget(1088, s["weight_bits"]) == 13010, s
+    assert s["description_size"] >= copy_bound(nums) > s["size_budget"], s
 
 
 def test_the_service_reports_the_identity_its_receipts_carry(work):
@@ -1067,7 +1091,7 @@ def test_a_checker_may_build_a_graph_of_the_linear_family_and_run_single_on_it(w
     assert r["status"] == "accepted" and r["certified_count"] == 64, r["reason"]
     s = r["scoring"]
     assert s["status"] == "scored", s
-    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v10"
+    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v11"
 
 
 def test_weight_sizes_are_read_for_free(work, tmp_path):

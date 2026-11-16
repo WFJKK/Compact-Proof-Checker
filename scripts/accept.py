@@ -78,12 +78,14 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
 import time
+from fractions import Fraction
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -95,6 +97,10 @@ TRUSTED_PREFIXES = ("CompactCheck.", "Mathlib.")
 KINDS = ("performance", "auxiliary")  # a proof of Target, or a lemma: accepted with no count and no score
 COST_MODEL = "cost-v3"  # the prices (CountedCheck.lean, core/check/cost.py of the pipeline): unchanged since the open lane began
 # the open lane's policy around those prices, versioned: what a checker may use for free and the budgets.
+# v11 (16 November 2026): the description-size budget follows the network's information: 8192 + 4 E (the budget
+# up to v10), raised where it is lower to half of weight_bits (the bits a copy of the weights must hold: each
+# weight's sign and significant bits), the share raising it to at most 16,384. attn-min2 v64d8-s1: 13,376
+# becomes 15,563; max2 v64-s0: 12,544 becomes 13,010. No budget goes down, and none changes from E = 2,048 on.
 # v10 (16 November 2026): `CostM.weight` and `CostM.cert` read through a balanced tree (`ReadTree`, Counted.lean)
 # instead of `a[i]!`, which the kernel evaluates by walking `i` cells per read: the same numbers and charges,
 # about log2 n kernel steps per read instead of i. A proof that unfolded the old definitions migrates with
@@ -121,7 +127,7 @@ COST_MODEL = "cost-v3"  # the prices (CountedCheck.lean, core/check/cost.py of t
 # v4 (22 October, after pilot 2 and review round 7): a free weightSize read, graph constructors of the
 # linear family and two audited match-compiler constants on the allowlist. v3 (21 October): language
 # version 4 and the description-size budget. Recorded in every receipt and in the policy digest.
-POLICY_VERSION = "open-lane-policy-v10"
+POLICY_VERSION = "open-lane-policy-v11"
 ASSURANCE = "kernel_checked_instance"  # a scored result's count and bill are both kernel-checked, never executed
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 IMPORT_LINE = re.compile(r"^\s*import\s+([A-Za-z_][A-Za-z0-9_.]*)\s*$")
@@ -136,14 +142,22 @@ ALLOWLIST_MAXIMUM = LEAN_PROJECT / "accept" / "allowlist-maximum.txt"
 KNOWLEDGE_CONDITIONS = ("minimal", "maximum")
 KNOWLEDGE = "minimal"
 # the scoring policy (docs/COUNTED.md): the checker's description size and the general layer's kernel work
-# are bounded. The size budget is base + per_param * E in acceptcheck's units (a node 1, a numeral or a
-# string 1 per bit), calibrated so that an honest checker fits (the pilot's column checker is under 8,000)
-# and a copy of the weights does not: an exported weight has 23 to 35 bits (its mantissa, shifted to the
-# tensor's common exponent), so a copy costs at least about 24 E however it is written, against 4 E plus
-# the base, on every network of the zoo with E above about 400 (max2 v64 has 1,088; scripts/test_accept.py
-# checks the arithmetic on every exported network). On a tiny network (E = 80) the whole set of weights is
-# smaller than any checker, and the budget cannot separate them. The environment variables are hooks for
-# tests; whatever is in force is in the policy digest and the receipt.
+# are bounded. The size budget, in acceptcheck's units (a node 1, a numeral or a string 1 per bit), is
+# base + per_param * E, or SHARE of weight_bits when that is larger, the share's part at most SHARE_CAP
+# (policy v11). weight_bits is the least a copy of the weights holds however it is written: each weight's sign
+# and significant bits, which do not compress. A checker that verified a copy against the weights and then
+# computed on it in free arithmetic is the cheat the budget blocks. Where the share decides the budget, a
+# checker holds at most half of weight_bits, so a copy measures at least twice the budget, and a quantity
+# that needs tensors holding more than half the bits stays out of reach: in the zoo's attention networks the
+# embedding and unembedding, which every logit needs, hold 47 to 79% of the bits, and where the share decides
+# the budget (v24, v64d8) a copy of both leaves under 700 units for the checker's code, or none. The base
+# decides it on small networks (attention at v16, E = 544), where an honest checker is about as large as the
+# weights: there it stays 8192 + 4 E, as up to v10 (on the tiny network, E = 80, the weights are smaller than
+# any checker and the budget separates nothing). The cap keeps the share from raising the budget of a large
+# network, where the base already exceeds every honest checker so far (the largest measured 14,043) and half a
+# copy would mostly be room for a partial copy. scripts/test_accept.py checks the arithmetic on every exported
+# network of the zoo. The environment variables are hooks for tests; whatever is in force is in the policy
+# digest and the receipt.
 # A planned checker's plan is free and untrusted (the soundness theorem holds for every plan), and bounded as the
 # fixed rules lane bounds its plan, the proof file's tree (core/check/checker.py: 4 nodes per input plus 10,000):
 # at most PLAN_PER_INPUT entries per input of the domain plus PLAN_BASE, each below 2^PLAN_ENTRY_BITS, so that it
@@ -154,11 +168,28 @@ PLAN_BASE = 10_000
 PLAN_ENTRY_BITS = 32
 SIZE_BUDGET_BASE = int(os.environ.get("ACCEPT_SIZE_BUDGET_BASE", 8192))
 SIZE_BUDGET_PER_PARAM = int(os.environ.get("ACCEPT_SIZE_BUDGET_PER_PARAM", 4))
+SIZE_BUDGET_SHARE = Fraction(os.environ.get("ACCEPT_SIZE_BUDGET_SHARE", "1/2"))  # of weight_bits
+SIZE_BUDGET_SHARE_CAP = int(os.environ.get("ACCEPT_SIZE_BUDGET_SHARE_CAP", 16384))
 GENERAL_KERNEL_BUDGET_MS = 120_000  # kernel time to replay the general layer
 
 
-def size_budget(extract: int) -> int:
-    return SIZE_BUDGET_BASE + SIZE_BUDGET_PER_PARAM * extract
+def weight_bits(net: dict) -> int:
+    """The least a copy of the network's parameters holds however it is written: for each weight its sign and
+    its significant bits, from its highest to its lowest nonzero bit (the exporter's integer over the tensor's
+    common exponent, whose trailing zeros carry nothing); 1 for a zero weight. Not counted, so that this stays
+    below any copy: where each weight's bits sit (its exponent), which a copy needs too. On the zoo the
+    significant bits do not compress (lzma, bz2 and zlib save under 1%) and the signs are balanced (16
+    November 2026). The `#const` weights are left out, as extraction_cost leaves them out."""
+    def bits(v: int) -> int:
+        v = abs(v)
+        return 1 + (v >> ((v & -v).bit_length() - 1)).bit_length() if v else 1
+    return sum(bits(v) for w in net["weights"] if not w["name"].startswith("#const") for v in w["ints"])
+
+
+def size_budget(extract: int, bits: int) -> int:
+    """The description-size budget of a network with `extract` parameters and `bits` = weight_bits."""
+    return max(SIZE_BUDGET_BASE + SIZE_BUDGET_PER_PARAM * extract,
+               min(math.floor(SIZE_BUDGET_SHARE * bits), SIZE_BUDGET_SHARE_CAP))
 
 
 def plan_problem(plan: list, domain: int) -> str | None:
@@ -715,12 +746,14 @@ def score_before_kernel(scored: dict, prot: dict, net_json: Path, trusted: list[
     Never raises for the candidate's faults."""
     net = json.loads(net_json.read_text())
     extract = extraction_cost(net)
+    bits = weight_bits(net)
     read = len(scored["certificate"])
     plan = scored.get("plan")
     out = {"status": None, "reason": None, "assurance": ASSURANCE, "cost_model": COST_MODEL,
            "bill": None, "extract": extract, "read": read, "length": None,
            "plan_entries": None if plan is None else len(plan),
-           "description_size": None, "size_budget": None if extract is None else size_budget(extract),
+           "description_size": None, "weight_bits": bits,
+           "size_budget": None if extract is None else size_budget(extract, bits),
            "general_kernel_ms": None, "general_kernel_budget_ms": GENERAL_KERNEL_BUDGET_MS, "rest_kernel_ms": None,
            "axioms": None}
     if extract is None:
@@ -815,7 +848,8 @@ def policy_digest() -> str:
     h = hashlib.sha256()
     h.update(allowlist_text().encode())
     h.update(json.dumps({"policy_version": POLICY_VERSION, "knowledge": KNOWLEDGE,
-                         "size_budget": [SIZE_BUDGET_BASE, SIZE_BUDGET_PER_PARAM],
+                         "size_budget": [SIZE_BUDGET_BASE, SIZE_BUDGET_PER_PARAM, str(SIZE_BUDGET_SHARE),
+                                         SIZE_BUDGET_SHARE_CAP],
                          "plan_bounds": [PLAN_PER_INPUT, PLAN_BASE, PLAN_ENTRY_BITS],
                          "general_kernel_budget_ms": GENERAL_KERNEL_BUDGET_MS,
                          "allowed_axioms": sorted(ALLOWED_AXIOMS), "trusted_prefixes": TRUSTED_PREFIXES}).encode())
@@ -882,8 +916,9 @@ def scoring_preview(ws: Path, module: str, checker: str, prot: dict, net_json: P
     last = last_json(chk["stdout"])
     if chk["timed_out"] or chk["rc"] != 0 or last is None:
         return {"error": "the closure check failed: " + excerpt(chk["stdout"] + chk["stderr"])}
-    extract = extraction_cost(json.loads(net_json.read_text()))
-    budget = None if extract is None else size_budget(extract)
+    net = json.loads(net_json.read_text())
+    extract = extraction_cost(net)
+    budget = None if extract is None else size_budget(extract, weight_bits(net))
     size = last.get("description_size")
     by = sorted((last.get("size_by") or {}).items(), key=lambda kv: -kv[1])
     out = {"checker": checker,

@@ -1,4 +1,4 @@
-# The counted language (step 2 of the open lane; version 4 of the language, policy v10, 16 November)
+# The counted language (step 2 of the open lane; version 4 of the language, policy v11, 16 November)
 
 How a scored open-lane proof gets a length: its checker `D` is written against an abstract interpreter
 whose operations are the only way to touch a number of the network, the service runs it with the
@@ -434,23 +434,59 @@ check, the service enforces, as policy (recorded in the receipt's policy digest)
 - a description-size budget: the size of the checker's computational closure (the checker and the
   definitions it uses, transitively through definitions and never through theorems: what it computes is
   a function of these bodies and of the interpreter), every node of every body counted 1, a numeral 1 per
-  bit, a string 8 per byte, measured as a tree (a repeated subterm counts each time), with no exemption by name, is at most `8192 + 4 E`. A
-  reviewer showed that data can live in constructors (`[true, false, ...]`) and in the shape of
-  applications alone (`fun c0 c1 z => c0 (c1 (c0 z))`), so the whole term is measured, and the rates make
-  a number of `b` bits cost at least `b` however it is written (a numeral or a string `b`, constructors
-  or applications at least `2 b`). An exported weight has 23 to 35 bits (its mantissa over the tensor's
-  common exponent), so a copy of the weights costs at least about `24 E`, against `4 E` plus the base: on
-  every size setting of the pipeline's zoo a copy is over the budget (max2 v64, E = 1,088: at least
-  34,044 against 12,544; `scripts/test_accept.py` checks the arithmetic on the zoo and refuses an actual
-  copy on max2 v64 under the default policy), while the pilot's column checker is under 8,000. This
-  bounds description length; it does not show the absence of compressed information, and on the tiny
-  test network (E = 80) the whole set of weights is smaller than any checker, so the budget separates
-  nothing there (its tests use a smaller base through an environment hook, recorded in the policy
-  digest);
+  bit, a string 8 per byte, measured as a tree (a repeated subterm counts each time), with no exemption by
+  name, is at most the network's budget (below). A reviewer showed that data can live in constructors
+  (`[true, false, ...]`) and in the shape of applications alone (`fun c0 c1 z => c0 (c1 (c0 z))`), so the
+  whole term is measured, and the rates make a number of `b` bits cost at least `b` however it is written
+  (a numeral or a string `b`, constructors or applications at least `2 b`). This bounds description length;
+  it does not show the absence of compressed information;
 - a kernel budget: replaying the general layer (timed on its own, before the rest) takes at most 120 s.
 
 These bound what the general layer can hide; they do not prove that nothing is hidden. The adversarial
 tests in `scripts/test_accept.py` say so in their names.
+
+### The size budget (policy v11, 16 November)
+
+What the budget blocks: a checker that holds a copy of the weights in its own code, checks the copy against
+the weights at about one charged operation per weight, and then computes on the copy in free arithmetic.
+So the budget is set from the least a copy holds, `weight_bits`: for each weight its sign and its
+significant bits, from its highest to its lowest nonzero bit (the trailing zeros that the tensor's common
+exponent adds carry nothing; where the bits sit is not counted, so a real copy holds more). On the zoo these
+bits do not compress (lzma, bz2 and zlib save under 1%) and the signs are balanced; a float32 weight has
+about 24 of them.
+
+    budget = max(8192 + 4 E, min(W / 2, 16384))    (W / 2 rounded down)
+
+with `W` = `weight_bits` and `E` the parameter count (the `#const` weights are in neither).
+
+- Where half of `W` decides the budget, a checker holds at most half of what the weights are, and a copy
+  measures at least twice the budget. Half, because a quantity computed from tensors that hold more than
+  half the bits stays out of reach: in the zoo's attention networks the embedding and the unembedding,
+  which every logit needs, hold 47 to 79% of the bits, and where half of `W` decides the budget (v24,
+  v64d8) a copy of both leaves under 700 units for the checker's code, or none.
+- Where `8192 + 4 E` decides it, the network is small (attention at v16, E = 544) and an honest checker is
+  about as large as the weights; the budget is v10's there. A copy is still over it (about 1.25 times),
+  but a copy of the embedding and the unembedding alone fits beside 4,000 units of code, as it did before.
+  On the tiny test network (E = 80) the weights are smaller than any checker and the budget separates
+  nothing (its tests use a smaller base and no share through environment hooks, recorded in the policy
+  digest).
+- The cap keeps the share from raising the budget of a large network: from E = 2,048 on, `8192 + 4 E` is
+  over every honest checker so far (the largest measured 14,043), and half a copy would mostly be room for
+  a partial copy. No budget is lower than v10's.
+
+| network | E | `W` | v10 | v11 |
+| --- | --- | --- | --- | --- |
+| attn-min2 v64d8 (s1) | 1,296 | 31,127 | 13,376 | 15,563 |
+| max2 v64 (s0) | 1,088 | 26,020 | 12,544 | 13,010 |
+| attn-max4 v24 (s0) | 1,200 | 28,857 | 12,992 | 14,428 |
+| xorformer-majority n12h1d8 (s0) | 393 | 20,814 | 9,764 | 10,407 |
+| attn-max4 v16 (s1) | 544 | 13,052 | 10,368 | 10,368 |
+| attn-min2 v64 (s0) | 8,256 | 198,155 | 41,216 | 41,216 |
+
+`scripts/test_accept.py` checks the rule on one network of every size setting of the zoo (a copy holds more
+than the budget, at least twice where the share decides; no budget below v10's) and refuses on max2 v64 a
+checker whose code holds only the significant bits of the weights (no signs, no exponents) under the default
+policy. Receipts carry `weight_bits` beside `size_budget`.
 
 ## Reproduction (`CountedCheck.lean`, `compactcheck cost`)
 
