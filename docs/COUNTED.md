@@ -1,4 +1,4 @@
-# The counted language (step 2 of the open lane; version 4 of the language, policy v9, 13 November)
+# The counted language (step 2 of the open lane; version 4 of the language, policy v10, 16 November)
 
 How a scored open-lane proof gets a length: its checker `D` is written against an abstract interpreter
 whose operations are the only way to touch a number of the network, the service runs it with the
@@ -50,7 +50,9 @@ charged gate. The full list of signatures is the structure itself (CountedOps.le
   With them a checker establishes that the weights are well formed (length equals the product of the
   shape) by a concrete comparison; before policy v4 (22 October) the only way was a whole forward pass
   through `single`, 63 operations on the tiny network, which every one of pilot 2's proofs paid once;
-- `cert i`: free (the certificate is charged once per proof, as `read`, 1 per number);
+- `cert i`: free (the certificate is charged once per proof, as `read`, 1 per number). Since policy v10
+  both `weight` and `cert` read through a balanced tree, for the kernel's sake only (section "Reading
+  weights in the kernel" below);
 - `lit n` for a numeral: 1 (as a number read from the proof file);
 - `exp`: the exponential's enclosure (`Exp.lean`), charged 3, as `cost-v3` charges a softmax entry;
 - `charge category n`: adds to the bill (a program can only make itself longer);
@@ -185,6 +187,52 @@ A soundness proof can meet the same evaluation: a `simp` or `split` on the run o
 of inputs can leave the kernel a term whose check evaluates that run (the test checker's first soundness
 proof failed this way). The test states its lemma for every list of indices and reaches
 `D Interp.counting` through a `rfl` equation and `rw`, as the examples do.
+
+## Reading weights in the kernel (policy v10, 16 November)
+
+In compiled code an `Array` is an array; the kernel knows `Array` only as a structure around a `List`. Up
+to policy v9, `weight name i` read `t.data[i]!`: the kernel walked `i` cells for every read, and walked
+again for the next one, since it remembers finished results, not partial walks. A checker that reads every
+entry of a tensor of `n` entries cost the kernel about `n^2 / 2` cell steps, and the memory of all of them
+until the theorem was done. On run attn-min2-ptl-3 (vocabulary 64, width 8) the reads were about 85% of
+the kernel's time: a fact reading 656 entries took 11.6 s at 2.8 GB on a 2-core cloud machine, one reading
+about 1,900 took 34 s at 5.2 GB.
+
+Since v10, `weight` and `cert` read through a `ReadTree` (`Counted.lean`): a balanced binary tree of the
+array's entries, built in one pass, in which entry `i` is found by going left or right at each node. Every
+read of one array in a theorem asks for the same tree (`ReadTree.ofList t.data.toList`), so the kernel
+builds it once per theorem and keeps it, and a read descends about `log₂ n` levels. Nothing else changes:
+the reads are free, they return the same numbers, and the statements the service builds are the same.
+Compiled code (`#eval`, the scoring preview) shares nothing between calls and would rebuild the tree at
+every read (the round-2 checker's `#eval` took 67 s instead of 1.5 s), so `weight` and `cert` are
+`@[implemented_by]` the array's own `a[i]?` (`weightImpl`, `certImpl`); `weightImpl_eq` and `certImpl_eq`
+prove the two the same function. The kernel never runs the implementations.
+
+Measured on the same 2-core machine (time of the module, peak memory of the process; same verdicts and
+bills):
+
+| | up to v9 | v10 |
+| --- | --- | --- |
+| round 2's 16 box facts (`FarB1`) | 190.8 s, 2.78 GB | 28.5 s, 0.77 GB |
+| round 2's first row facts (`FarS1`) | 271.0 s, 5.12 GB | 38.5 s, 1.08 GB |
+| round 2's last row facts (`FarS7`) | 128.2 s, 3.53 GB | 25.5 s, 0.98 GB |
+| one theorem reading the first 64 / 128 / 256 / 512 entries of a 512-entry tensor, each value compared | 0.3 / 0.8 / 2.8 / 13.2 s | 0.2 / 0.2 / 0.4 / 1.1 s |
+| one read in a theorem of its own (16 such theorems) | about 63 ms each | about 81 ms each |
+
+Within a theorem the tree is built once (the cost grows with the number of reads, not their square); a new
+theorem builds it again, so a fact with only a few reads pays a little more than before.
+
+What a soundness proof uses:
+
+- `CostM.weight_run_eq`: `(weight name i).run env c` is entry `i` of the tensor named `name`, when there is
+  one (`(lookup name).bind (·.data[i]?)`), and the bill unchanged; `weight_spec` the same read backwards,
+  `weight_run_of_lookup` forwards, `weight_run_get` in the form `v.val = t.get i ∧ c' = c`;
+- `CostM.cert_run_eq`, `cert_spec`, `cert_run_of_lt`, `cert_run_get` likewise for the certificate.
+
+A proof written against the old definitions (one that unfolded `CostM.weight` or `CostM.cert` and split on
+its `if`) goes through after replacing the unfolding by `rw [CostM.weight_run_eq_ite]` or
+`rw [CostM.cert_run_eq_ite]`: those are the old definitions, as equations. The examples kept from earlier
+runs are resubmitted that way by the tests (`test_accept.py`, `migrate_reads`), their files unchanged.
 
 ## Attention networks: the general single rule and split instances (23 October)
 

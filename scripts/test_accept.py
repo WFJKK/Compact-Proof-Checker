@@ -70,6 +70,29 @@ def submit(candidate: Path, work: Path, mode: str = "hardened", env: dict | None
     return receipt
 
 
+READ_UNFOLDINGS = {"simp only [CostM.weight] at": "rw [CostM.weight_run_eq_ite] at",
+                   "simp only [CostM.cert] at": "rw [CostM.cert_run_eq_ite] at"}
+
+
+def migrate_reads(example: Path, tmp_path: Path) -> Path:
+    """A copy of an example kept from an earlier run, with the one step policy v10 changes: its proofs unfolded
+    `CostM.weight` (or `CostM.cert`) and split on the old definition's `if`; since v10 a read goes through a
+    `ReadTree`, and the old definition is the equation `CostM.weight_run_eq_ite` (`cert_run_eq_ite`). The
+    example's own files are left as the agent wrote them; nothing but these unfoldings changes."""
+    d = tmp_path / ("migrated-" + example.name)
+    if d.exists():
+        shutil.rmtree(d)
+    shutil.copytree(example, d)
+    for p in d.rglob("*.lean"):
+        text = p.read_text()
+        new = text
+        for old, rep in READ_UNFOLDINGS.items():
+            new = new.replace(old, rep)
+        if new != text:
+            p.write_text(new)
+    return d
+
+
 def variant(tmp_path: Path, name: str, lean: str | None = None, manifest: dict | None = None,
             module_path: str = "Candidate/Max2Tiny.lean", base: Path = EXAMPLE) -> Path:
     """A copy of the example with its Lean source or manifest changed."""
@@ -412,7 +435,7 @@ def test_a_checker_may_compare_a_list_with_the_empty_list(work, tmp_path):
     assert r["status"] == "accepted", r["reason"]
     s = r["scoring"]
     assert s["status"] == "scored", s
-    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v9"
+    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v10"
 
 
 # ---- planned checkers (policy v9) ---------------------------------------------------------------------------
@@ -448,7 +471,7 @@ def test_a_planned_checker_is_scored_and_its_plan_is_free(work):
     assert s["status"] == "scored", s
     assert s["bill"] == 60 * 63 and s["read"] == 0 and s["length"] == s["bill"] + s["extract"] + s["read"]
     assert s["plan_entries"] == 64 and s["description_size"] <= s["size_budget"]
-    assert r["policy_version"] == "open-lane-policy-v9"
+    assert r["policy_version"] == "open-lane-policy-v10"
 
 
 def test_a_planned_soundness_proof_must_hold_for_every_plan(work, tmp_path):
@@ -622,12 +645,13 @@ def test_the_development_compile_previews_the_scoring_checks(work, tmp_path):
     assert not list((work / "receipts").glob("*Dev*"))  # still not a submission
 
 
-def test_the_agents_pilot_proof_is_verified_and_refused_scoring_in_the_current_language(work):
+def test_the_agents_pilot_proof_is_verified_and_refused_scoring_in_the_current_language(work, tmp_path):
     """The pilot's third submission of round 1 (20 October 2026), kept as the agent wrote it: the columns of
     M = U L E, 23 of 64 inputs for a bill of 458. It was written in the first counted language (a concrete
     `CostM Nat`, with concrete booleans); every later version (a checker is a function of the interpreter)
-    refuses it: its checker uses `CostM` directly. Its mathematics is still verified."""
-    r = submit(AGENT, work)
+    refuses it: its checker uses `CostM` directly. Its mathematics is still verified (its read lemma migrated
+    to policy v10's reads, `migrate_reads`)."""
+    r = submit(migrate_reads(AGENT, tmp_path), work)
     assert r["status"] == "accepted" and r["certified_count"] == 23, r["reason"]
     s = r["scoring"]
     assert s["status"] == "refused" and "CostM" in s["reason"], s
@@ -843,11 +867,12 @@ def test_a_decision_tree_over_truth_values_bills_every_node(work):
     assert s["bill"] == 53 == 2 * 4 + 3 * (2 ** 4 - 1) and s["length"] == 53 + 80
 
 
-def test_the_ported_column_proof_is_scored_under_language_v4(work):
+def test_the_ported_column_proof_is_scored_under_language_v4(work, tmp_path):
     """The agent's column proof ported by hand to version 4 (examples/open_lane/max2_tiny_cols23_v3): the
     interface keeps a meaningful method expressible, provable and scoreable. 23 of 64, bill 562 (the
-    agent's 458 plus 104 charged gates), length 642; its description size calibrates the default budget."""
-    r = submit(PORT, work)
+    agent's 458 plus 104 charged gates), length 642; its description size calibrates the default budget. Its
+    read lemma migrated to policy v10's reads (`migrate_reads`)."""
+    r = submit(migrate_reads(PORT, tmp_path), work)
     assert r["status"] == "accepted" and r["certified_count"] == 23, r["reason"]
     s = r["scoring"]
     assert s["status"] == "scored", s["reason"]
@@ -961,12 +986,12 @@ PILOT2_EXPECTED = {  # from the receipts the Mac's service wrote on 22 October 2
 
 
 @pytest.mark.parametrize("name", sorted(PILOT2_EXPECTED))
-def test_the_pilot_2_proofs_reproduce_their_receipts(work, name):
+def test_the_pilot_2_proofs_reproduce_their_receipts(work, name, tmp_path):
     """The agent's seven submissions of pilot 2 (examples/open_lane/pilot2_max2_tiny), resubmitted: the same
     count, scoring status, bill and length as the receipts of the run, and the description size recorded
-    there, under the default policy."""
+    there, under the default policy, their read lemmas migrated to policy v10's reads (`migrate_reads`)."""
     count, status, bill, length = PILOT2_EXPECTED[name]
-    r = submit(PILOT2 / name, work)
+    r = submit(migrate_reads(PILOT2 / name, tmp_path), work)
     assert r["status"] == "accepted" and r["certified_count"] == count, (name, r["reason"])
     s = r["scoring"]
     assert s["status"] == status, (name, s)
@@ -1042,7 +1067,7 @@ def test_a_checker_may_build_a_graph_of_the_linear_family_and_run_single_on_it(w
     assert r["status"] == "accepted" and r["certified_count"] == 64, r["reason"]
     s = r["scoring"]
     assert s["status"] == "scored", s
-    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v9"
+    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v10"
 
 
 def test_weight_sizes_are_read_for_free(work, tmp_path):

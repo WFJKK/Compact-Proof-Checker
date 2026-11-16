@@ -95,6 +95,10 @@ TRUSTED_PREFIXES = ("CompactCheck.", "Mathlib.")
 KINDS = ("performance", "auxiliary")  # a proof of Target, or a lemma: accepted with no count and no score
 COST_MODEL = "cost-v3"  # the prices (CountedCheck.lean, core/check/cost.py of the pipeline): unchanged since the open lane began
 # the open lane's policy around those prices, versioned: what a checker may use for free and the budgets.
+# v10 (16 November 2026): `CostM.weight` and `CostM.cert` read through a balanced tree (`ReadTree`, Counted.lean)
+# instead of `a[i]!`, which the kernel evaluates by walking `i` cells per read: the same numbers and charges,
+# about log2 n kernel steps per read instead of i. A proof that unfolded the old definitions migrates with
+# `rw [CostM.weight_run_eq_ite]` / `rw [CostM.cert_run_eq_ite]`; the allowlist and budgets are unchanged.
 # v9 (13 November 2026): planned checkers. A scored manifest may give a plan (natural numbers); the checker is
 # then `D : List Nat → Checker`, its soundness theorem holds for every plan and its instance runs on the protected
 # module's `plan`, which the general layer may not mention. The plan is free, as the fixed rules lane's plan is
@@ -117,7 +121,7 @@ COST_MODEL = "cost-v3"  # the prices (CountedCheck.lean, core/check/cost.py of t
 # v4 (22 October, after pilot 2 and review round 7): a free weightSize read, graph constructors of the
 # linear family and two audited match-compiler constants on the allowlist. v3 (21 October): language
 # version 4 and the description-size budget. Recorded in every receipt and in the policy digest.
-POLICY_VERSION = "open-lane-policy-v9"
+POLICY_VERSION = "open-lane-policy-v10"
 ASSURANCE = "kernel_checked_instance"  # a scored result's count and bill are both kernel-checked, never executed
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 IMPORT_LINE = re.compile(r"^\s*import\s+([A-Za-z_][A-Za-z0-9_.]*)\s*$")
