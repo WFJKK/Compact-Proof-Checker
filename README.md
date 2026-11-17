@@ -283,6 +283,15 @@ names and the flags of the proof file. Choosing what to check where is bookkeepi
 network's numbers, so it is capped in size instead (the description-size budget of D; a limit on the
 proof file's numbers, strings and tree nodes).
 
+Free code is also where an open-lane proof could hide work: a checker that held the network's own weights
+could compare the real ones with them cheaply and compute on its copy for free. Two things stand against
+that (docs/COUNTED.md, "The cap" and "The last-bits test"). The size budget keeps a copy out where the
+weights are much larger than a checker, which the smallest networks are not. And every scored proof's
+checker is run again on copies of the network whose weights differ in their last bits: one that computes on
+the weights certifies the same, one that rests on a stored copy certifies nothing and is refused scoring.
+Neither sees a copy that is rounded and compared with a tolerance; on small networks that is left to
+someone reading the checker.
+
 **Open lane.** With $`\mathrm{cert}`$ the certificate (numbers the proof passes to D),
 
 ```math

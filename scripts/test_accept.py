@@ -295,8 +295,9 @@ def test_the_scored_proof_is_verified_and_scored(work):
     assert s["measured_bill"] == s["bill"] and s["measured_length"] == s["length"]  # what the kernel verified
     assert s["description_size"] <= s["size_budget"] and s["general_kernel_ms"] <= s["general_kernel_budget_ms"]
     assert set(s["axioms"]) <= {"propext", "Classical.choice", "Quot.sound"}
-    # one replay verifies and scores (check-score), after the closure check, which needs none
-    assert [x["step"] for x in r["steps"]] == ["protected", "compile", "closure", "kernel"]
+    # one replay verifies and scores (check-score), after the closure check, which needs none; the last-bits test
+    # follows it, on compiled code (policy v14)
+    assert [x["step"] for x in r["steps"]] == ["protected", "compile", "closure", "kernel", "last_bits"]
     assert [x["scores"] for x in r["steps"] if x["step"] == "kernel"] == [True]
     assert all(x["kernel"] is False for x in r["steps"] if x["step"] == "compile")
 
@@ -456,7 +457,7 @@ def test_a_checker_may_compare_a_list_with_the_empty_list(work, tmp_path):
     assert r["status"] == "accepted", r["reason"]
     s = r["scoring"]
     assert s["status"] == "scored", s
-    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v13"
+    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v14"
 
 
 # ---- the protected modules: the network apart from the claim (17 November 2026) --------------------------------
@@ -595,6 +596,244 @@ def test_the_protected_modules_of_a_network_of_width_32_compile(work):
     assert Path(r["olean"]).is_file() and (Path(r["lean_path_dir"]) / "Protected" / "N_attn_min2_v64_s0.olean").is_file()
 
 
+# ---- the last-bits test (policy v14) ----------------------------------------------------------------------------
+STORED = PROJECT / "examples" / "open_lane" / "max2_tiny_stored_weight"
+
+
+def test_the_copies_of_the_last_bits_test_change_every_parameter_a_little_and_nothing_else():
+    """The copies are made from the network file alone, so for any network: every nonzero parameter moves by
+    about 2^-level of itself and at least one unit of its tensor's last place, a zero stays a zero, the
+    exporter's constants and everything that is not a weight stay, and a copy is the same on every machine."""
+    sys.path.insert(0, str(HERE))
+    import accept
+    sys.path.pop(0)
+    net = {"format": "compactcheck-network-v1", "network": "toy-s0", "graph": {"nodes": []}, "task": "max",
+           "weights": [{"name": "E", "shape": [2, 3], "exp": -32, "ints": [1505767040, -3579024640, 0, 5, -1, 2 ** 40]},
+                       {"name": "#const0", "shape": [], "exp": -54, "ints": [6369051672525773]}]}
+    before = json.dumps(net)
+    for level in (20, 16, 12, 8):
+        a, b = accept.last_bits_copy(net, level, 0), accept.last_bits_copy(net, level, 1)
+        assert json.dumps(net) == before and a == accept.last_bits_copy(net, level, 0)
+        assert {k: v for k, v in a.items() if k != "weights"} == {k: v for k, v in net.items() if k != "weights"}
+        assert a["weights"][1] == net["weights"][1]  # the constant of the model's code
+        for copy in (a, b):
+            w = copy["weights"][0]
+            assert {k: v for k, v in w.items() if k != "ints"} == {k: v for k, v in net["weights"][0].items() if k != "ints"}
+            for m, m2 in zip(net["weights"][0]["ints"], w["ints"]):
+                assert (m2 == 0) if m == 0 else (m2 != m and abs(m2 - m) == max(1, abs(m) >> level)), (level, m, m2)
+        assert a != b or level == 8  # two copies differ (in the signs of the moves)
+    assert accept.last_bits_copy(net, 20, 0) != accept.last_bits_copy({**net, "network": "toy-s1"}, 20, 0)
+
+
+def test_a_checker_that_computes_on_the_weights_keeps_its_count_on_the_copies(work):
+    """The brute-force proof, and the same proof split over the network's module and the claim's: on every copy
+    of the network, down to the coarsest level run, the checker certifies the 64 inputs it certifies on the
+    network. The compiled run on the network itself gave what the kernel established, or the proof would not
+    be scored. (Run attn-min2-ptl-3's proof, 1,889 inputs: 1,889 on every copy down to level 12; measured, not
+    part of this suite.)"""
+    for example in (SCORED, SPLIT):
+        r = submit(example, work)
+        s = r["scoring"]
+        assert s["status"] == "scored", s
+        lb = s["last_bits"]
+        assert lb["passed"] is True and lb["levels"] == [20, 16] and lb["recorded"] == [12, 8] and lb["copies"] == 2
+        assert [x["level"] for x in lb["runs"]] == [20, 20, 16, 16, 12, 12, 8, 8] and {x["count"] for x in lb["runs"]} == {64}
+        assert lb["least_share"] == 1.0 and lb["holds_to"] == 8
+        step = next(x for x in r["steps"] if x["step"] == "last_bits")
+        assert step["rc"] == 0 and step["status"] == "ok" and step["timed_out"] is False
+
+
+def test_a_checker_whose_count_hangs_on_a_stored_weight_is_refused_scoring(work):
+    """examples/open_lane/max2_tiny_stored_weight: brute force that also asks that the first embedding weight be
+    exactly the number written into the checker's code. Sound, accepted by the kernel, 64 inputs on this network.
+    It is the smallest case of the pattern the size budget cannot keep out of a small network: a checker that
+    holds the network's numbers, compares the weights with them and rests its count on the comparison (with all
+    the weights held, the rest of its work can be done for free on its copy). On every copy of the network the
+    comparison fails and it certifies nothing: refused scoring, verified as before, its measured length kept."""
+    r = submit(STORED, work)
+    assert r["status"] == "accepted" and r["certified_count"] == 64, r["reason"]
+    s = r["scoring"]
+    assert s["status"] == "refused" and "last-bits test" in s["reason"] and "certifies 0 inputs" in s["reason"], s
+    assert s["bill"] is None and s["length"] is None and r["score_eligible"] is False
+    assert s["measured_bill"] == 64 * 63 + 64 + 4 and s["measured_length"] == s["measured_bill"] + s["extract"] + s["read"]
+    lb = s["last_bits"]
+    assert lb["passed"] is False and {x["count"] for x in lb["runs"]} == {0} and lb["least_share"] == 0.0 and lb["holds_to"] is None
+    assert s["description_size"] <= s["size_budget"]  # the size budget has nothing against it
+
+
+def test_the_development_compile_says_what_the_last_bits_test_will_say(work, tmp_path):
+    """The preview of a development compile runs the last-bits test as the score step does, so that a count that
+    hangs on the weights' last bits is seen for the price of a compile and not of a submission (whose kernel
+    check comes first). It is given two minutes at most, and no more than the caller's call has left: a caller
+    that stops the call from outside (the pipeline's lean_check) says how long it gives it, and a compile that
+    used the time up is reported as compiled, with the test not run."""
+    ws = tmp_path / "ws"
+    (ws / "Candidate").mkdir(parents=True)
+    (ws / "Candidate" / "StoredWeight.lean").write_text((STORED / "Candidate" / "StoredWeight.lean").read_text())
+    receipts = len(list((work / "receipts").glob("*")))
+    base = [sys.executable, "-B", str(HERE / "accept.py"), "compile", str(ws), "Candidate/StoredWeight.lean", "--repo",
+            str(REPO), "--work", str(work), "--model", "tests/max2_tiny", "--network", "max2_tiny-v8-s0", "--claimed", "64",
+            "--checker", "Candidate.StoredWeight.D"]
+    out = json.loads(subprocess.run(base, capture_output=True, text=True, timeout=1800).stdout)
+    lb = out["scoring_preview"]["last_bits"]
+    assert out["ok"] is True and out["scoring_preview"]["counted_language"] == "ok", out
+    assert (lb["count"], lb["bill"]) == (64, 4100) and lb["passes"] is False and lb["holds_to"] is None, lb
+    assert lb["least_count_on_copies"] == 0 and {r["count"] for r in lb["runs"]} == {0}, lb
+    out = json.loads(subprocess.run(base + ["--limit-s", "1"], capture_output=True, text=True, timeout=1800).stdout)
+    lb = out["scoring_preview"]["last_bits"]
+    assert out["ok"] is True and lb["passes"] is None and "no time left" in lb["reason"], out
+    assert out["scoring_preview"]["description_size"] > 0  # the rest of the preview is there
+    assert len(list((work / "receipts").glob("*"))) == receipts  # and nothing was submitted
+
+
+def test_a_module_that_replaces_compiled_code_is_refused_scoring(work, tmp_path):
+    """The last-bits test runs the checker compiled, where the kernel ran its definition. `implemented_by` gives a
+    definition other compiled code than its body, so a checker could pass the test with code the kernel never
+    saw. A candidate whose modules use it (or `extern`, `csimp`, `initialize`) is not run and not scored."""
+    extra = ("\n\ndef plain (n : Nat) : Nat := n + 1\ndef other (n : Nat) : Nat := n + 2\n"
+             "attribute [implemented_by other] plain\n\nend Candidate.Max2TinyScored\n")
+    assert SCORED_SOURCE.rstrip().endswith("end Candidate.Max2TinyScored")
+    src = SCORED_SOURCE.rstrip()[: -len("end Candidate.Max2TinyScored")].rstrip() + extra
+    r = submit(scored_variant(tmp_path, "replaced-code", src), work)
+    assert r["status"] == "accepted", r["reason"]
+    s = r["scoring"]
+    assert s["status"] == "refused" and "implemented_by" in s["reason"] and "Candidate.Max2TinyScored" in s["reason"], s
+    assert s["last_bits"]["passed"] is False and s["last_bits"]["runs"] is None and s["measured_length"] is not None
+
+
+
+def test_a_checker_without_compiled_code_is_refused_scoring(work, tmp_path):
+    """The kernel runs a definition whether or not Lean compiled it; the last-bits test needs the compiled code.
+    A `noncomputable` checker is verified, and refused scoring with that reason: the candidate's to mend, not an
+    error of the service."""
+    r = submit(scored_variant(tmp_path, "no-compiled-code", SCORED_SOURCE.replace(NEW_D, "noncomputable " + NEW_D)), work)
+    assert r["status"] == "accepted" and r["certified_count"] == 64, r["reason"]
+    s = r["scoring"]
+    assert s["status"] == "refused" and "no compiled code" in s["reason"] and "noncomputable" in s["reason"], s
+    assert s["last_bits"]["passed"] is False and s["last_bits"]["runs"] is None
+    assert s["measured_length"] is not None and s["length"] is None and r["score_eligible"] is False
+    assert next(x for x in r["steps"] if x["step"] == "last_bits")["status"] == "uncompiled"
+
+
+DEEP = """import Protected.N_max2_tiny_v8_s0_c64
+import CompactCheck.CountedOps
+namespace Candidate.Deep
+open CompactCheck Protected.N_max2_tiny_v8_s0_c64
+
+def deep (I : Interp) : Nat → I.M I.N
+  | 0 => pure I.nzero
+  | n + 1 => do
+    let ok ← I.single graph task [0, 0]
+    let m ← deep I n
+    pure (I.nadd (I.countB ok) m)
+
+@[export candidate_deep_helper]
+def helper (n : Nat) : Nat := n + 1
+
+def D : Checker := fun I => deep I 60000
+end Candidate.Deep
+"""
+
+
+def test_the_preview_says_why_the_last_bits_test_could_not_say_anything(work, tmp_path):
+    """Three ways a development preview has no count to show, each told apart. A module with `export` (a name
+    under which other compiled code can be found) is not run. A checker whose runs do not fit the preview's time
+    is reported as not run to the end, with how far it came, and not as failing: a preview gives the runs less
+    time than a submission does (here 10 s, by the test's hook, for runs of 60,000 forward passes each)."""
+    ws = tmp_path / "ws"
+    (ws / "Candidate").mkdir(parents=True)
+    base = [sys.executable, "-B", str(HERE / "accept.py"), "compile", str(ws), "Candidate/Deep.lean", "--repo", str(REPO),
+            "--work", str(work), "--model", "tests/max2_tiny", "--network", "max2_tiny-v8-s0", "--claimed", "64",
+            "--checker", "Candidate.Deep.D"]
+    (ws / "Candidate" / "Deep.lean").write_text(DEEP)
+    out = json.loads(subprocess.run(base, capture_output=True, text=True, timeout=1800).stdout)
+    lb = out["scoring_preview"]["last_bits"]
+    assert out["ok"] is True and lb["passes"] is False and "`export`" in lb["reason"] and "Candidate.Deep" in lb["reason"], out
+    (ws / "Candidate" / "Deep.lean").write_text(DEEP.replace("@[export candidate_deep_helper]\n", ""))
+    out = json.loads(subprocess.run(base, capture_output=True, text=True, timeout=1800,
+                                    env={**os.environ, "ACCEPT_PREVIEW_LAST_BITS_S": "10"}).stdout)
+    lb = out["scoring_preview"]["last_bits"]
+    assert out["ok"] is True and lb["passes"] is None, out
+    assert "not run to the end" in lb["reason"] and "did not finish within 10 s" in lb["reason"], lb
+    assert "on the network" in lb["reason"] or "on copy" in lb["reason"], lb
+
+
+def test_what_ends_a_run_of_the_last_bits_test_is_laid_at_the_right_door(monkeypatch, tmp_path):
+    """The step after the probe, with the probe's answers given (no Lean). What the candidate's own code did is
+    a refusal of scoring with the reason, the proof verified as before and its measured length kept: other
+    compiled code, no compiled code, a run that ended without a result or ran out of time. What the service
+    could not do is an error, and the receipt's scoring is then unsettled: it does not read as scored."""
+    sys.path.insert(0, str(HERE))
+    import accept
+    sys.path.pop(0)
+    scored = {"checker": "Candidate.X.D", "claimed_bill": 4032}
+    block = {"status": "scored", "reason": None, "bill": 4032, "length": 4112, "measured_bill": 4032, "measured_length": 4112}
+    answers = {
+        "replaced": ({"status": "replaced", "module": "Candidate.X", "by": "implemented_by"}, "`implemented_by`"),
+        "uncompiled": ({"status": "uncompiled", "reason": "(interpreter) unknown declaration 'Candidate.X.D'"}, "no compiled code"),
+        "untyped": ({"status": "untyped", "reason": "not a checker: the type of Candidate.X.D is not Checker"}, "not a checker"),
+        "stopped": ({"status": "stopped", "done": 3, "reason": "its run on copy 3 of 8 ended without a result (exit code -6)"},
+                    "did not run to the end: its run on copy 3 of 8"),
+        "other count": ({"status": "ok", "base": {"count": 60, "bill": 4032}, "counts": [(20, 64)] * 8}, "the kernel established 64"),
+        "other bill": ({"status": "ok", "base": {"count": 64, "bill": 9}, "counts": [(20, 64)] * 8}, "the kernel established 64 and 4032"),
+        "last bits": ({"status": "ok", "base": {"count": 64, "bill": 4032},
+                       "counts": [(20, 64), (20, 64), (16, 64), (16, 57), (12, 0), (12, 0), (8, 0), (8, 0)]}, "certifies 57 inputs"),
+    }
+    for name, (res, said) in answers.items():
+        monkeypatch.setattr(accept, "last_bits_runs", lambda *a, _r=res, **k: {"rc": 0, "seconds": 1.0, "timed_out": False, **_r})
+        receipt = {"steps": [], "scoring": dict(block)}
+        out = accept.last_bits(scored, dict(block), 64, {}, tmp_path / "n.json", [], tmp_path, {}, "process", tmp_path, [],
+                               tmp_path, receipt)
+        assert out["status"] == "refused" and said in out["reason"], (name, out)
+        assert out["bill"] is None and out["length"] is None and out["measured_length"] == 4112, (name, out)
+        assert out["last_bits"]["passed"] is False and receipt["steps"][-1]["step"] == "last_bits", (name, out)
+    # nine tenths is the line: 58 of 64 keeps it, at the deciding levels only
+    kept = {"status": "ok", "base": {"count": 64, "bill": 4032},
+            "counts": [(20, 64), (20, 64), (16, 58), (16, 64), (12, 3), (12, 64), (8, 0), (8, 0)]}
+    monkeypatch.setattr(accept, "last_bits_runs", lambda *a, **k: {"rc": 0, "seconds": 1.0, "timed_out": False, **kept})
+    out = accept.last_bits(scored, dict(block), 64, {}, tmp_path / "n.json", [], tmp_path, {}, "process", tmp_path, [], tmp_path,
+                           {"steps": []})
+    assert out["status"] == "scored" and out["length"] == 4112 and out["last_bits"]["passed"] is True, out
+    assert out["last_bits"]["least_share"] == round(58 / 64, 4) and out["last_bits"]["holds_to"] == 16, out
+    # the service's own failure
+    monkeypatch.setattr(accept, "last_bits_runs", lambda *a, **k: {"rc": 1, "seconds": 1.0, "timed_out": False, "status": "error",
+                                                                   "reason": "unknown command probe"})
+    receipt = {"steps": [], "scoring": dict(block)}
+    with pytest.raises(accept.Infra, match="unknown command probe"):
+        accept.last_bits(scored, dict(block), 64, {}, tmp_path / "n.json", [], tmp_path, {}, "process", tmp_path, [], tmp_path, receipt)
+    assert receipt["scoring"]["status"] is None and receipt["scoring"]["length"] is None, receipt
+    assert receipt["scoring"]["last_bits"]["passed"] is None and receipt["scoring"]["measured_length"] == 4112
+
+
+def test_a_probe_that_says_nothing_points_at_the_binary(monkeypatch, tmp_path):
+    """An acceptcheck built before the probe existed prints its usage and no line of the probe's. That is the
+    service's state, never the candidate's, and the error says what to do about it."""
+    sys.path.insert(0, str(HERE))
+    import accept
+    sys.path.pop(0)
+    net = tmp_path / "toy.json"
+    net.write_text(json.dumps({"network": "toy-s0", "weights": [{"name": "E", "shape": [2], "exp": -8, "ints": [3, -5]}]}))
+    answers = iter([{"rc": 1, "stdout": "", "stderr": "usage: acceptcheck check ...", "timed_out": False, "seconds": 0.1},
+                    {"rc": -6, "stdout": '{"status":"loaded"}\n{"status":"run","done":2}\n', "timed_out": False, "seconds": 3.0,
+                     "stderr": "libc++abi: terminating: deep recursion was detected at 'interpreter' (potential solution: more)\n#1 x"},
+                    {"rc": -9, "stdout": '{"status":"loaded"}\n', "stderr": "timed out", "timed_out": True, "seconds": 9.0},
+                    {"rc": -9, "stdout": "", "stderr": "timed out", "timed_out": True, "seconds": 9.0}])
+    monkeypatch.setattr(accept, "run_boxed", lambda *a, **k: next(answers))
+    monkeypatch.setattr(accept, "acceptcheck_binary", lambda: Path("/nowhere/acceptcheck"))
+    monkeypatch.setattr(accept, "toolchain_root", lambda lean: tmp_path)
+    run = lambda: accept.last_bits_runs("Candidate.X.D", False, {"module": "Protected.N_toy_s0_c1"}, net, [], tmp_path, {},
+                                        "process", tmp_path, [], tmp_path, timeout_s=9)
+    r = run()
+    assert r["status"] == "error" and "lake build acceptcheck" in r["reason"] and "usage" in r["reason"], r
+    r = run()  # ended in the candidate's code, after two runs: the candidate's
+    assert r["status"] == "stopped" and r["done"] == 2 and "on copy 2 of 8" in r["reason"], r
+    assert "deep recursion was detected at 'interpreter'" in r["reason"] and "potential solution" not in r["reason"], r
+    r = run()  # out of time in the candidate's code
+    assert r["status"] == "stopped" and r["timed_out"] and "on the network did not finish within 9 s" in r["reason"], r
+    r = run()  # out of time before the candidate's code was reached: the service's
+    assert r["status"] == "error" and "did not start its runs" in r["reason"], r
+
+
 # ---- planned checkers (policy v9) ---------------------------------------------------------------------------
 PLANNED = PROJECT / "examples" / "open_lane" / "max2_tiny_planned"
 PLANNED_SOURCE = (PLANNED / "Candidate" / "Max2TinyPlanned.lean").read_text()
@@ -629,7 +868,7 @@ def test_a_planned_checker_is_scored_and_its_plan_is_free(work):
     assert s["bill"] == 60 * 63 and s["read"] == 0 and s["length"] == s["bill"] + s["extract"] + s["read"]
     assert s["plan_entries"] == 64 and s["description_size"] <= s["size_budget"]
     assert s["plan_bits"] == 184 <= s["plan_bits_budget"] == s["weight_bits"] // 4  # 60 ones, 4 zeros: 60 * 3 + 4
-    assert r["policy_version"] == "open-lane-policy-v13"
+    assert r["policy_version"] == "open-lane-policy-v14"
 
 
 def test_a_planned_soundness_proof_must_hold_for_every_plan(work, tmp_path):
@@ -809,6 +1048,11 @@ def test_the_development_compile_previews_the_scoring_checks(work, tmp_path):
     assert p["counted_language"] == "ok" and p["offending"] == [], p
     assert p["description_size"] == final["description_size"] and p["size_budget"] == final["size_budget"], (p, final)
     assert p["within_budget"] is True and p["largest_definitions"][0]["size"] > 0
+    # the last-bits test, as the score step ran it on the submission: the count and the bill the compiled checker
+    # gives on the network (what the instance theorem will have to state), and the count on every copy
+    lb = p["last_bits"]
+    assert (lb["count"], lb["bill"]) == (64, final["bill"]) and lb["passes"] is True and lb["holds_to"] == 8, lb
+    assert lb["runs"] == final["last_bits"]["runs"] and lb["least_count_on_copies"] == 64, (lb, final["last_bits"])
     # outside the counted language: the preview names the constants the score step would
     bare = SCORED_SOURCE.replace(NEW_D,
                                  "def D : Checker := fun I => countSingles I graph task "
@@ -821,6 +1065,7 @@ def test_the_development_compile_previews_the_scoring_checks(work, tmp_path):
     p = out["scoring_preview"]
     assert out["ok"] is True and p["counted_language"] == "refused", p
     assert "CompactCheck.Interp.counting" in p["offending"] and "CompactCheck.CostM.billed" in p["offending"], p
+    assert "last_bits" not in p  # a checker outside the counted language is not run
     # a name that is not the candidate's
     out = json.loads(subprocess.run(base + ["--checker", "Mathlib.foo"], capture_output=True, text=True, timeout=1800).stdout)
     assert "error" in out["scoring_preview"]
@@ -1065,7 +1310,8 @@ def test_the_ported_column_proof_is_scored_under_language_v4(work, tmp_path):
 def test_weight_bits_counts_the_sign_and_the_significant_bits_of_each_weight():
     """weight_bits by hand: a weight's trailing zeros (the tensor's common exponent) carry nothing, its sign one
     bit, a zero weight one bit; the exporter's #const weights are not parameters. size_budget (policy v11) is
-    v10's 8192 + 4 E, raised where it is lower to half of weight_bits, the share raising it to at most 16,384."""
+    v10's 8192 + 4 E, raised where it is lower to half of weight_bits, the share raising it to at most 16,384;
+    since policy v14 no budget is above 24,576."""
     sys.path.insert(0, str(HERE))
     import accept
     sys.path.pop(0)
@@ -1074,7 +1320,9 @@ def test_weight_bits_counts_the_sign_and_the_significant_bits_of_each_weight():
     assert accept.size_budget(1296, 31127) == 15563  # attn-min2-v64d8-s1: half of weight_bits
     assert accept.size_budget(544, 13052) == 8192 + 4 * 544  # attn-max4-v16-s1: the base
     assert accept.size_budget(1500, 40000) == 16384  # the cap
-    assert accept.size_budget(8256, 198333) == 8192 + 4 * 8256  # from E = 2,048 on, v10's budget
+    assert accept.size_budget(3000, 72000) == 8192 + 4 * 3000  # from E = 2,048 on, v10's budget
+    assert accept.size_budget(4096, 98000) == 8192 + 4 * 4096 == 24576  # up to the cap of policy v14
+    assert accept.size_budget(8256, 198333) == 24576  # and no further: v10's budget here was 41,216
 
 
 def test_plan_bits_is_the_length_of_a_prefix_code():
@@ -1128,6 +1376,8 @@ def test_a_table_written_with_an_alphabet_of_variables_measures_a_third_of_its_b
     p = out["scoring_preview"]
     assert p["counted_language"] == "ok" and p["offending"] == [], p
     assert p["description_size"] == 11536 and 8 * N == 32768, p  # 2.84 bits per unit
+    # the constant measured here is a number, not a checker: the preview's last-bits test says so and runs nothing
+    assert p["last_bits"]["passes"] is None and "not a checker" in p["last_bits"]["reason"], p
 
 
 def test_the_default_size_budget_is_below_a_copy_of_the_weights_on_every_zoo_setting():
@@ -1135,7 +1385,13 @@ def test_the_default_size_budget_is_below_a_copy_of_the_weights_on_every_zoo_set
     pipeline's zoo, its weights as the exporter writes them (integers over the tensor's common power-of-two
     exponent). A copy holds at least weight_bits (each weight's sign and significant bits; at most the
     exporter's bits plus a sign per weight), which is over the default budget everywhere, and at least twice
-    it where the share decides it. No budget is below v10's 8192 + 4 E, and from E = 2,048 on none differs.
+    it where the share decides it. No budget is below v10's 8192 + 4 E up to the cap of policy v14 (24,576, which
+    decides from 4,097 parameters on, where no network has a proof yet), and from E = 2,048 to the cap none
+    differs. Above the cap the budget no longer grows with the network, so the room it leaves for a copy falls as
+    the network grows: beside 3,000 units of other code, at the 2.84 bits a unit can hold, 14 bits per weight at
+    4,352 parameters, 7 at 8,256 and 5 at 12,352 (13 at both before the cap). An exact copy, 24 bits per weight,
+    did not fit at those sizes before the cap either; a rounded one fits with it too, coarser, which the budget
+    does not keep out at the zoo's sizes.
     The tiny test network (E = 80) is the exception the other size tests work around with SMALL_BUDGET."""
     sys.path.insert(0, str(HERE))
     import accept
@@ -1165,9 +1421,18 @@ def test_the_default_size_budget_is_below_a_copy_of_the_weights_on_every_zoo_set
             row = (manifest.parent.parent.name, n["setting"], E, bits, budget)
             seen.append(row)
             assert bits <= sum(copy_bound(w["ints"]) for w in weights) + E, row
-            assert budget >= v10 and (E < 2048 or budget == v10), row
-            assert bits > budget and (budget == v10 or bits >= 2 * budget), row
-    assert len(seen) >= 6, seen
+            cap = accept.SIZE_BUDGET_CAP
+            assert cap == 24576 and budget == min(cap, max(v10, budget)), row
+            assert budget >= min(v10, cap) and (E < 2048 or budget == min(v10, cap)), row
+            assert bits > budget and (budget in (v10, cap) or bits >= 2 * budget), row
+            if v10 > cap:
+                # capped: a copy of the weights does not fit in the whole budget, even written as densely as the
+                # densest encoding measured (32,768 bits in 11,536 units: the alphabet of 256 variables below)
+                assert budget == cap and bits >= 4 * cap and budget * 32768 < bits * 11536, row
+    assert len(seen) >= 6 and any(8192 + 4 * E > 24576 for _, _, E, _, _ in seen), seen
+    # the cap is over every real checker measured (14,043, run attn-min2-ptl-1) and over the budget of every network
+    # that has a proof (attn-min2 v64d8: 15,563)
+    assert accept.size_budget(1296, 31127) == 15563 and accept.size_budget(8256, 198000) == 24576
 
 
 def test_a_copy_of_the_weights_is_refused_under_the_default_policy_on_a_real_network(work, tmp_path):
@@ -1325,7 +1590,7 @@ def test_a_checker_may_build_a_graph_of_the_linear_family_and_run_single_on_it(w
     assert r["status"] == "accepted" and r["certified_count"] == 64, r["reason"]
     s = r["scoring"]
     assert s["status"] == "scored", s
-    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v13"
+    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v14"
 
 
 def test_weight_sizes_are_read_for_free(work, tmp_path):

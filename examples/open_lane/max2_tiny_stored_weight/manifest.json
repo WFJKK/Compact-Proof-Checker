@@ -1,0 +1,5 @@
+{"schema": "open-lane-candidate-v1", "candidate_id": "max2-tiny-stored-weight", "model": "tests/max2_tiny",
+ "network": "max2_tiny-v8-s0", "claimed_count": 64, "theorem": "Candidate.StoredWeight.performance",
+ "modules": ["Candidate/StoredWeight.lean"],
+ "scored": {"checker": "Candidate.StoredWeight.D", "sound": "Candidate.StoredWeight.D_sound",
+            "instance": "Candidate.StoredWeight.D_instance", "certificate": [], "claimed_bill": 4100}}

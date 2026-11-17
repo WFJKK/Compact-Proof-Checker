@@ -719,6 +719,139 @@ def runProtected (netPath : String) (mod : Name) (olean : String) : IO UInt32 :=
         ("domain", Lean.toJson (CompactCheck.shapeSize net.task.space))]
   return 0
 
+/-! ## The checker run on other weights: the last-bits test
+
+`acceptcheck probe <protected module> <checker> <network.json>... -- <module>=<olean>...` runs a scored
+proof's checker, as compiled, with the proof's own certificate (and plan, `probe-planned`), on the weights of
+each network file given, and prints the count and the bill of each run. The service gives it the network itself
+and copies of it whose weights differ in their last bits (scripts/accept.py, `last_bits`).
+
+What it is for. A checker computes for free on whatever its own code holds, so one that holds the network's
+weights can compare the real weights with them at a few charged operations each and do all its work on its
+copy. Its count stands or falls with that comparison: change the last bit of a weight and it certifies
+nothing. A checker that computes on the weights it is given certifies what it certified, give or take the
+inputs whose evidence hung on those bits.
+
+What it is not. It runs compiled code, not the kernel: the kernel's run is the instance theorem, and one
+more run of it per copy would cost what the whole check costs. So the first file must be the network
+itself, and the service compares that run with what the kernel established; and a candidate module that
+gives a definition another compiled implementation, or runs code when loaded, is not run at all
+(`replacesCompiledCode`). A checker without compiled code (`noncomputable`) cannot be run, and the probe
+says so; so it does of a name whose type is not a checker's. And it sees a copy only where the copy is
+compared exactly: a rounded copy with a tolerance passes. -/
+
+/-- Whether a compiled module gives a definition other compiled code than its body (`implemented_by`,
+    `extern` or `csimp` entries, or `export`, a name under which the interpreter may find other code) or runs
+    code when it is loaded (`initialize`). A scored checker runs in the kernel; the last-bits test runs it
+    compiled, and is about the same checker only if the two are the same code; and loading a candidate's
+    module must run nothing of the candidate's. -/
+def replacesCompiledCode (data : ModuleData) : Option String :=
+  -- the extensions in which Lean keeps these attributes; one of them has entries only in a module that uses it
+  let marks : List (Name × String) := [(`Lean.Compiler.implementedByAttr, "implemented_by"), (`Lean.externAttr, "extern"),
+    (`Lean.exportAttr, "export"), (`Lean.Compiler.CSimp.ext, "csimp"), (`Lean.regularInitAttr, "initialize"),
+    (`Lean.builtinInitAttr, "builtin_initialize")]
+  data.entries.findSome? fun (ext, entries) =>
+    if entries.size > 0 then (marks.find? (·.1 == ext)).map (·.2) else none
+
+/-- A line of the probe's output, written out at once: the service reads how far a probe came from the lines
+    it wrote, also when the process ended in the candidate's code. -/
+def jsonOutNow (fields : List (String × Json)) : IO Unit := do
+  jsonOut fields
+  (← IO.getStdout).flush
+
+/-- The compiled checker as a function of the weights. An error says whose it is: the candidate's (true) when
+    its checker is not a checker or has no compiled code to run, the service's otherwise. Before the checker's
+    own code is first touched, the line `{"status":"loaded"}` is written: what ends the process after it is the
+    candidate's.
+
+    The compiled object is read as the function its type says it is, so the type is checked first, by the
+    kernel: `Checker`, or `List Nat → Checker` for a planned one. For a scored proof the soundness and instance
+    statements have said so already; a development preview may be asked about any name. -/
+unsafe def evalCheckerImpl (prot D module : Name) (planned : Bool) :
+    IO (Except (Bool × String) (CompactCheck.Weights Rat → Option (Nat × Nat))) := do
+  -- Lean loads compiled code only with initializers enabled. The trusted modules' may run, as for
+  -- `evalProtected`; the candidate's modules have none (`runProbe` refuses one that has)
+  enableInitializersExecution
+  let env ← importModules #[{ module := prot }, { module := module }] {} (trustLevel := 0) (loadExts := true)
+  let checker := mkConst ``CompactCheck.Checker
+  let expected := if planned then mkForall `plan .default (mkApp (mkConst ``List [Level.zero]) (mkConst ``Nat)) checker else checker
+  let typed := match env.find? D with
+    | some ci => ci.levelParams.isEmpty && (match Kernel.isDefEq env {} ci.type expected with
+      | .ok same => same
+      | .error _ => false)
+    | none => false
+  unless typed do
+    return .error (true, s!"not a checker: the type of {D} is not {if planned then "List Nat → Checker" else "Checker"}")
+  let cert ← match env.evalConst CompactCheck.Cert {} (prot ++ `cert) with
+    | .ok c => pure c
+    | .error e => return .error (false, s!"the protected certificate cannot be read: {e}")
+  let plan ← if planned then
+      match env.evalConst (List Nat) {} (prot ++ `plan) with
+      | .ok p => pure p
+      | .error e => return .error (false, s!"the protected plan cannot be read: {e}")
+    else pure []
+  jsonOutNow [("status", "loaded")]
+  -- a checker is a function of an interpreter, which lives one universe up: `evalConst` gives the compiled
+  -- object, read here as the function it is
+  match env.evalConst NonScalar {} D with
+  | .error e => return .error (true, e)
+  | .ok obj =>
+    if planned then
+      let d : List Nat → CompactCheck.Checker := unsafeCast obj
+      return .ok fun w => CompactCheck.CostM.billed (d plan CompactCheck.Interp.counting) ⟨w, cert⟩
+    else
+      let d : CompactCheck.Checker := unsafeCast obj
+      return .ok fun w => CompactCheck.CostM.billed (d CompactCheck.Interp.counting) ⟨w, cert⟩
+
+@[implemented_by evalCheckerImpl]
+opaque evalChecker (prot D module : Name) (planned : Bool) :
+    IO (Except (Bool × String) (CompactCheck.Weights Rat → Option (Nat × Nat)))
+
+/-- Run the checker on every network file. The checker's type is not checked here: the service calls this
+    for a proof the kernel has scored, whose soundness and instance statements apply `D` as a checker.
+
+    The output is one JSON object per line and the last line decides. Everything of the service's is done
+    first (the modules read, the network files parsed, the protected certificate and plan evaluated); then
+    `{"status":"loaded"}`, and `{"status":"run","done":k}` after each run. So a process that ends without a
+    last word (a stack that overflows, memory, the time limit) ended in the candidate's code exactly when
+    `loaded` was written. -/
+def runProbe (prot D : Name) (planned : Bool) (nets : List String) (modules : List (String × String)) : IO UInt32 := do
+  initSearchPath (← findSysroot)
+  -- the candidate's modules: none may replace compiled code or run code when loaded, and one declares the checker
+  let mut home : Option Name := none
+  for (m, olean) in modules do
+    let (data, _) ← readModuleData olean
+    if let some what := replacesCompiledCode data then
+      jsonOut [("status", "replaced"), ("by", what), ("module", m)]
+      return 0
+    if data.constants.any (·.name == D) then home := some m.toName
+  let some module := home
+    | jsonOut [("status", "error"), ("reason", s!"none of the candidate's modules declares {D}")]
+      return 0
+  let mut weights : Array (CompactCheck.Weights Rat) := #[]
+  for path in nets do
+    match CompactCheck.parseNetwork (← CompactCheck.readJson path) with
+    | .ok n => weights := weights.push n.weights
+    | .error e =>
+      jsonOut [("status", "error"), ("reason", s!"cannot read {path}: {e}")]
+      return 0
+  let run ← match ← evalChecker prot D module planned with
+    | .ok f => pure f
+    | .error (true, e) =>
+      jsonOut [("status", if e.startsWith "not a checker" then "untyped" else "uncompiled"), ("reason", e)]
+      return 0
+    | .error (false, e) =>
+      jsonOut [("status", "error"), ("reason", e)]
+      return 0
+  let mut runs : Array Json := #[]
+  for w in weights do
+    runs := runs.push (match run w with
+      | some (n, bill) => Json.mkObj [("count", Lean.toJson n), ("bill", Lean.toJson bill)]
+      | none => Json.mkObj [("count", Json.null), ("bill", Json.null)])
+    jsonOutNow [("status", "run"), ("done", Lean.toJson runs.size)]
+  jsonOut [("status", "ok"), ("runs", Json.arr runs)]
+  return 0
+
 end Accept
 
 def usage : String :=
@@ -728,6 +861,7 @@ def usage : String :=
   "       acceptcheck check-score <target> <candidate const> <protected module> <checker> <sound> <instance> <count> <bill> <trusted modules...> -- <candidate oleans...>\n" ++
   "       acceptcheck check-score-planned <target> <candidate const> <protected module> <checker> <sound> <instance> <count> <bill> <trusted modules...> -- <candidate oleans...>\n" ++
   "       acceptcheck lemma <theorem> <trusted modules...> -- <candidate oleans...>\n" ++
+  "       acceptcheck probe[-planned] <protected module> <checker> <network.json>... -- <module>=<olean>...\n" ++
   "       acceptcheck size <checker const> <trusted modules...> -- <candidate oleans...>\n" ++
   "       acceptcheck closure <checker const> <allowlist> <protected module> <trusted modules...> -- <candidate oleans...>\n" ++
   "       acceptcheck protected <network.json> <protected module> <protected olean>"
@@ -805,6 +939,15 @@ def main (args : List String) : IO UInt32 := do
       return 2
     Accept.runLemma cand.toName (trusted.map String.toName) oleans
   | ["protected", net, mod, olean] => Accept.runProtected net mod.toName olean
+  | cmd@"probe" :: prot :: d :: rest | cmd@"probe-planned" :: prot :: d :: rest =>
+    let (nets, pairs) := rest.span (· != "--")
+    let modules := (pairs.drop 1).filterMap fun (s : String) => match s.splitOn "=" with
+      | m :: f :: more => some (m, "=".intercalate (f :: more))
+      | _ => none
+    if nets.isEmpty || modules.isEmpty then
+      IO.eprintln usage
+      return 2
+    Accept.runProbe prot.toName d.toName (cmd == "probe-planned") nets modules
   | _ =>
     IO.eprintln usage
     return 2

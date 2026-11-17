@@ -1,4 +1,4 @@
-# The counted language (step 2 of the open lane; version 4 of the language, policy v13, 17 November)
+# The counted language (step 2 of the open lane; version 4 of the language, policy v14, 17 November)
 
 How a scored open-lane proof gets a length: its checker `D` is written against an abstract interpreter
 whose operations are the only way to touch a number of the network, the service runs it with the
@@ -634,11 +634,102 @@ four times as much: more than the weights of a network of that size. So on such 
 lets an honest checker through and keeps a copy out, whatever the measure. The budget stops a plain copy
 (numerals, strings, booleans, Church encodings), and that is all it is relied on for.
 
-What holds against a copy is not a size. The pipeline's seed check locks the checker and runs it, unchanged,
-on a second network: a copy in the code certifies nothing there, since the code was fixed before that
-network was shown, and everything the agent writes for the second network is the instance, of which the
-plan (bounded in information, above) is the only free data. `scripts/test_accept.py` pins the measurement
-(`..._a_known_gap`), so that a change of the measure shows.
+What tells a copy apart is not a size. Two things do, each in part. The last-bits test (below, policy v14)
+runs the checker on the same network with its weights' last bits changed, and sees an exact copy on any
+network. The pipeline's seed check locks the checker and runs it, unchanged, on a second network: a copy in
+the code certifies nothing there, since the code was fixed before that network was shown, and everything the
+agent writes for the second network is the instance, of which the plan (bounded in information, above) is
+the only free data. A proof of a circuit that only the first network has certifies nothing there either, so
+the seed check is a measurement beside a score and not a condition on it. `scripts/test_accept.py` pins the
+measurement (`..._a_known_gap`), so that a change of the measure shows.
+
+### The cap, and what a size limit can do (policy v14, 17 November)
+
+The budget grew with the network, 4 units per parameter. A unit can hold 2.84 bits (the alphabet above), so
+that growth alone left room for a copy of the weights rounded to 11 bits each, at any size. A checker's code
+does not grow with the weights (it reads its sizes from them), so since v14 no budget is above 24,576 units:
+1.75 times the largest real checker measured (14,043), above the budget of every network that has a proof
+(the largest 15,563), and deciding from 4,097 parameters on, where there is no proof yet.
+
+What that leaves for a copy, beside 3,000 units of other code, in bits per weight (float32 weights have 24):
+
+| network | parameters | budget before | budget | room before | room |
+| --- | --- | --- | --- | --- | --- |
+| attention v16 | 544 | 10,368 | 10,368 | 38 | 38 |
+| attn-min2 v64d8 | 1,296 | 15,563 | 15,563 | 27 | 27 |
+| max2 v128 | 4,352 | 25,600 | 24,576 | 15 | 14 |
+| attention v64, width 32 | 8,256 | 41,216 | 24,576 | 13 | 7 |
+| attention v128, width 32 | 12,352 | 57,600 | 24,576 | 13 | 5 |
+
+An exact copy (24 bits a weight) was out from 4,352 parameters on before the cap as well. What the cap
+changes is how finely a rounded copy can be held, and that the room shrinks as the network grows: 13 bits a
+weight before at 8,256 parameters, 7 now, and 5 at 12,352. It does not keep a rounded copy out at the zoo's
+sizes, and on the small networks, where a real checker measures what the weights do, no size limit keeps
+anything out. A size limit is a wall only where the weights are many times a checker: at 50,000 parameters
+the room is about one bit per weight.
+
+### The last-bits test (policy v14, 17 November)
+
+What the size limit cannot do on a small network, a test does for the plain form of the cheat, on any
+network. A scored proof's checker is run again on copies of the network whose weights differ in their last
+bits, with the proof's own certificate and plan. The copies are made from the network file and from nothing
+else (`last_bits_copy` in `scripts/accept.py`): every nonzero parameter is moved by about `2^-level` of
+itself, at least one unit of its tensor's last place, up or down; zeros and the exporter's constants stay.
+Levels 20 and 16 change the last 4 and 8 of a float32 weight's 24 bits.
+
+- A checker that computes on the weights it is given certifies what it certified: the copies are the same
+  network to far more digits than any margin.
+- A checker whose count rests on comparing the weights with numbers it holds certifies nothing: the
+  comparison fails. With all the weights held, everything else such a checker does can be done for free on
+  its copy, which is the cheat the size budget was made for.
+
+The rule: on every copy at levels 20 and 16 (two copies each) the checker must certify at least 9/10 of what
+it certifies on the network, or the proof is refused scoring ("the last-bits test: ..."), verified as before
+and with its measured length kept. Levels 12 and 8 are run for the record: a real checker's certificate and
+plan were made for the network and stop fitting at some distance from it, and `last_bits.holds_to` says how
+far the count held. The receipt's `scoring.last_bits` has every run.
+
+Measured:
+
+| proof | on the network | levels 20, 16, 12 | level 8 |
+| --- | --- | --- | --- |
+| brute force, `max2_tiny_scored` | 64 | 64 on every copy | 64, 64 |
+| run attn-min2-ptl-3, round 2 (61 thresholds in its code) | 1,889 | 1,889 on every copy | 0 and 1,763 |
+| `max2_tiny_stored_weight` (one stored weight) | 64 | 0 on every copy | 0, 0 |
+
+The test takes 2 s on the tiny network and 11 s on the run's proof (nine runs of a bill of 190,761).
+
+How it is run, and what follows from that. The kernel's run of the checker is the instance theorem; one
+more per copy would cost what the whole check costs. So the copies are run on compiled code
+(`acceptcheck probe`), and three things keep that honest: the first run is on the network itself and must
+give the count and the bill the kernel established; a candidate module that gives a definition other
+compiled code than its body (`implemented_by`, `extern`, `export`, `csimp`) or runs code when it is loaded
+(`initialize`) is not run, and the proof is refused scoring; and the probe runs in the box.
+
+A checker the test cannot run is not scored either, and the reason says which case it is: no compiled code
+(a `noncomputable` checker, which the kernel runs all the same), or a run of the checker's own code that
+does not come to an end (Lean's interpreter stops a recursion a few million deep; one a million deep runs).
+These are the candidate's to mend. What the service could not do itself is an error and no verdict, and the
+receipt's scoring is then unsettled. The probe tells the two apart by what it wrote: a line before it first
+touches the candidate's code, and one after each run.
+
+The development compile shows it before a submission: `accept.py compile --checker` makes the same runs on
+the workspace's compiled modules and reports them in `scoring_preview.last_bits` (the count and the bill on
+the network, the count on each copy, whether that passes). A count that hangs on the weights' last bits then
+costs a compile to see, not a submission, whose kernel check comes first. The preview's runs are given two
+minutes at most (`PREVIEW_LAST_BITS_S`) and no more than the caller's call has left (`--limit-s`), so they
+never turn a finished compile into a call that was stopped.
+
+What it does not see: a copy compared with a tolerance. A checker that holds the weights rounded and asks
+only that the real ones be near them passes at every level finer than its tolerance. That form is bounded by
+the size budget alone (the table above), and where that leaves room, by someone reading the checker.
+
+Where it would be wrong: a network whose weights have exact structure that a proof rightly uses, such as
+whole-number weights written by hand, or two tensors stored apart that are equal entry for entry. The copies
+move every nonzero parameter on its own, so they break that structure and such a proof would be refused.
+Zeros stay zeros, the exporter's constants stay, and a tensor used twice in the graph is one tensor, so the
+common cases hold; trained weights have no other exact structure. It is a limit to state for a network
+built by hand.
 
 ## Reproduction (`CountedCheck.lean`, `compactcheck cost`)
 
