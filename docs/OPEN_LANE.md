@@ -12,8 +12,8 @@ A folder with `manifest.json` and the modules it names:
      "model": "tests/max2_tiny", "network": "max2_tiny-v8-s0", "claimed_count": 63,
      "theorem": "Candidate.Max2Tiny.performance", "modules": ["Candidate/Max2Tiny.lean"]}
 
-The modules live under `Candidate/` and may import only each other, the protected module, `CompactCheck.*`
-and `Mathlib.*`. The theorem must have the type `Protected.<module>.Target`, which is
+The modules live under `Candidate/` and may import only each other, the submission's protected modules,
+`CompactCheck.*` and `Mathlib.*`. The theorem must have the type `Protected.<module>.Target`, which is
 
     claimedCount ≤ numCorrect graph weights task
 
@@ -29,9 +29,12 @@ of inputs the network answers correctly over the reals, ties counting as wrong.
 
 1. Checks the manifest and the modules' imports.
 2. Exports the network (`scripts/export_network.py`, the pipeline's own tracer and exact weights) and
-   writes the protected module `Protected.N_<network>_c<claimed>` with `scripts/make_protected.py`; compiles
-   it; and checks its constants against the network file with `acceptcheck protected`, which reads the file
-   with the checker's reader (`parseNetwork`) and compares graph, weights and task.
+   writes the protected modules with `scripts/make_protected.py`: the claim's,
+   `Protected.N_<network>_c<claimed>`, with the graph, the weights, the task and the target, and beside it
+   the network's, `Protected.N_<network>`, with the same graph, weights and task under a name no claim
+   changes (docs/COUNTED.md, "The protected modules"); compiles them, the network's once for a network; and
+   checks the claim module's constants against the network file with `acceptcheck protected`, which reads
+   the file with the checker's reader (`parseNetwork`) and compares graph, weights and task.
 3. Compiles each candidate module with `lean` in a box: on Linux, Landlock with no sockets, reading only the
    toolchain, this project, the workspace and system files, writing only the workspace's `out/` and `tmp/`;
    on macOS with `--mode seatbelt` (asked for by name until it has passed its test on a Mac), a

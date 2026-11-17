@@ -23,6 +23,7 @@ import CompactCheck.ContractTest
 import CompactCheck.SymmetryTest
 import CompactCheck.ApproxTest
 import CompactCheck.Semantics
+import CompactCheck.SemanticsKernel
 import CompactCheck.SemanticsRandomTest
 import CompactCheck.Exp
 import CompactCheck.ExpTest

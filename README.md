@@ -169,7 +169,9 @@ prove the statement. This lane is for arguments the rules can't express.
 
 The statement itself comes from the service, not from the proof. `scripts/accept.py` writes a protected module
 with the network's graph, its exact weights and the target `claimedCount ≤ numCorrect graph weights task`, and
-the kernel has to accept the submitted proof (we call a submission a candidate) of exactly that. The candidate
+the kernel has to accept the submitted proof (we call a submission a candidate) of exactly that. (The service
+also writes the graph and the weights into a module of their own, whose name does not change with the claimed
+count: a proof's facts about the weights can import that one, and stay compiled when the claim changes.) The candidate
 is compiled in a sandbox, and every definition and theorem in it is re-checked by the kernel from scratch.
 
 ```mermaid

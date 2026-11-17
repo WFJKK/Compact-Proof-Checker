@@ -1,4 +1,4 @@
-# The counted language (step 2 of the open lane; version 4 of the language, policy v12, 17 November)
+# The counted language (step 2 of the open lane; version 4 of the language, policy v13, 17 November)
 
 How a scored open-lane proof gets a length: its checker `D` is written against an abstract interpreter
 whose operations are the only way to touch a number of the network, the service runs it with the
@@ -234,6 +234,47 @@ its `if`) goes through after replacing the unfolding by `rw [CostM.weight_run_eq
 `rw [CostM.cert_run_eq_ite]`: those are the old definitions, as equations. The examples kept from earlier
 runs are resubmitted that way by the tests (`test_accept.py`, `migrate_reads`), their files unchanged.
 
+## Running the specification in the kernel (`SemanticsKernel.lean`, 17 November)
+
+The fast reads above are for a checker's reads of the weights. A proof can also need the kernel to run the
+specification itself: `semOps g w x ops vals` or `semGraph g w x` (`Semantics.lean`) on numbers, or on
+symbols in place of the weights, to get the network's function in closed form. Run attn-min2-ptl-3 did the
+second, in three decided theorems; that module needs more memory than a 6 GB machine gives a process.
+
+The specification's definitions are written for reading and for compiled code. For the kernel an `Array` is
+a `List`:
+
+- building: `(Array.range n).map f` (in `Tensor.ofFn` and the linear operations), `Array.map` and
+  `Array.ofFn` add one entry at a time at the end of the list, so the kernel walks the list for every entry
+  and keeps every step until the theorem is done. Measured on a 2-core cloud machine, over the 2.1 GB a
+  module's imports take: an array of 128 entries costs 1 s and 60 MB, 256 entries 2 s and 270 MB, 512
+  entries 9 s and 1.05 GB. The same list built with `List.range` and `List.map` costs nothing measurable;
+- reading: `t.data.getD i 0` walks `i` cells at every read, as a checker's reads did before policy v10.
+
+`CompactCheck/SemanticsKernel.lean` gives every operation a second definition, a copy of the specification's
+text in which a tensor is built as a list (`Tensor.ofFnK`, `rangeMapK`, `Tensor.mapK`) and read through a
+`ReadTree` (`Tensor.getK`, `Tensor.entryK`), and proves each equal to the specification's (`matmulOp_eqK`
+and so on, up to `semOps_eqK` and `semGraph_eqK`). The specification is not changed, and nothing trusted is
+added: the equations are theorems. A proof rewrites with them and lets the kernel decide the statement about
+`semOpsK`:
+
+    theorem run : (semOps g w x ops vals).map f = some r := by
+      rw [semOps_eqK]; decide +kernel
+
+Measured on that run's three theorems (time of a module with one theorem, peak memory of the process; the
+imports alone are 2.4 s and 2.1 GB; same machine):
+
+| the run of | `semOps`, as submitted | `semOpsK`, the run's tensors | `semOpsK`, tensors built from lists |
+| --- | --- | --- | --- |
+| operations 1 to 4 (embedding) | killed at 5.8 GB after 79 s | 18.3 s, 3.9 GB | 7.4 s, 2.8 GB |
+| operations 5 to 20 (attention) | 13.6 s, 2.6 GB | 3.4 s, 2.5 GB | 3.8 s, 2.4 GB |
+| operations 21 to 25 (unembedding) | 39.1 s, 5.8 GB | 19.5 s, 2.8 GB | 6.2 s, 2.6 GB |
+
+The middle column is the run's module with `rw [semOps_eqK]` added and nothing else. What it still pays for
+is its own symbolic weights, written with `Array.ofFn` (512 entries twice): a tensor a proof writes itself
+is built by the kernel too, and is cheap as `((List.range n).map f).toArray` (the last column).
+`examples/open_lane/max2_tiny_kernel_run` is a lemma of that form, accepted by the service.
+
 ## Attention networks: the general single rule and split instances (23 October)
 
 `single` runs the linear checker; on a network with attention its cost function has no price for softmax
@@ -383,8 +424,8 @@ A scored submission adds to its manifest
     "scored": {"checker": ..., "sound": ..., "instance": ..., "certificate": [numbers], "claimed_bill": L}
 
 and, for a planned checker, `"plan": [natural numbers]`. The certificate (integers, floats, or `[p, q]` pairs)
-becomes the protected module's `cert`, and its hash becomes part of the module's name; a plan becomes its
-`plan`, with its own hash in the name. The receipt's `claim_kind` is `performance` (a proof of Target) or
+becomes the protected `cert`, in a module of its own named by its hash, and that hash is part of the claim
+module's name; a plan becomes `plan` in the same way (the next section). The receipt's `claim_kind` is `performance` (a proof of Target) or
 `auxiliary` (a lemma with any statement, accepted with no count and no score: `"kind": "auxiliary"` in the
 manifest), `score_eligible` says whether it was scored, and the `scoring` block says `scored` or `refused`
 (with the reason) and gives the length in `cost-v3` units:
@@ -402,6 +443,75 @@ operations, `extract`
 and `read` as above, the arithmetic categories through the primitives. `tree` has no counterpart: the
 structure of a scored proof is its program, bounded by the literal budget below rather than charged. The
 fixed rules lane does not charge a proof file's plan either, so the same proof costs the same in both lanes.
+
+## The protected modules: the network apart from the claim (policy v13, 17 November)
+
+The protected module of a claim, `Protected.N_<network>_c<claimed>`, has the certificate's and the plan's
+hashes in its name. Every change of the claimed count, the certificate or the plan gives it another name, so
+every candidate module that imports it has to be edited and compiled again, the kernel facts about the
+weights among them. In run attn-min2-ptl-3 that was about 20 compiles in a round.
+
+The claim's module stays what it was, text for text. Beside it `scripts/make_protected.py` now writes the
+same definitions in modules whose names do not change with the claim:
+
+| module | holds | changes with |
+| --- | --- | --- |
+| `Protected.N_<network>_c<claimed>[_h..][_p..]` | `graph`, `weights`, `task`, `cert`, `plan`, `claimedCount`, `Target` | the network, the claim, the certificate, the plan |
+| `Protected.N_<network>` | `graph`, `weights`, `task` | the network |
+| `Protected.N_<network>_h<hash>` | `cert` | the certificate |
+| `Protected.N_<network>_p<hash>` | `plan` | the plan |
+
+What a candidate gains: a module that imports `Protected.N_<network>` alone does not depend on the claim. A
+checker, its soundness proof and every kernel fact about the weights can be such modules; a fact about the
+certificate imports the certificate's module, which changes only when the certificate does. Only the module
+that proves `Target` (and states the instance in the service's form) names the claim's module.
+`Protected.N_<network>.weights` and the claim's `weights` are two constants with one definition, term for
+term, so a fact about the first is a fact about the second: Lean and the kernel see it by unfolding both and
+finding the same term (`exact`, `show`, `rfl`). `examples/open_lane/max2_tiny_split` is the brute-force
+proof in that shape; the tests compile its fact once and then prove another claimed count against it without
+compiling it again.
+
+Why the claim's module does not import the network's and rename its constants (the first version of this
+change did, with `abbrev`): a proof that unfolds `graph` by name (`simp only [graph, ...]`, `unfold graph`)
+then stops at the network's name instead of reaching the operations. A proof kept from an earlier run broke
+that way. With the definitions written out in both modules, everything written against the claim's module
+compiles as it did.
+
+How it is built: the network's, certificate's and plan's modules are compiled once each
+(`<work>/protected/parts/<module>`, cached by source), and their object files are copied beside the claim's
+module (`<work>/protected/<claim module>/out`), because Lean looks for every module of the package `Protected`
+in the first folder of its search path that has that package. A candidate is compiled against that one folder
+and may import the protected modules of its own submission and no other.
+
+Wide networks: a weight tensor of 2,048 entries (width 32, vocabulary 64) needs more than Lean's default
+recursion depth, and one of 4,096 entries (vocabulary 128) more than its compiler's default step limit. The
+protected module of such a network did not compile, so the open lane stopped at width 8. The modules now set
+both for the weights (`set_option maxRecDepth ... in`, `set_option maxHeartbeats 0 in`; the service limits a
+compile's time itself). Measured on a 2-core cloud machine: the two modules of attn-min2-v64-s0 (8,257
+weights) compile and check in 78 s, those of attn-min2-v128-s0 (12,353 weights) in 143 s. The claim's module
+is about half of that, and it is compiled again for every new claim: at these widths a change of the
+claimed count costs a minute before the candidate's own modules.
+
+What is trusted: the claim's module, as before. `acceptcheck protected` evaluates its `graph`, `weights` and
+`task` and compares them with the network file, and every statement the service checks (the target, the
+soundness statement, the instance) is written with its constants. The other three modules are a convenience
+and need not be trusted: a fact about one of their constants counts only where the kernel finds that constant
+equal to the claim's.
+
+What stays as it was: the general layer may use `graph` and `task` (of the network's module or the claim's)
+and no other protected constant; the weights, the certificate and the plan reach a checker only through the
+interpreter and the instance. Nothing about the score changes: the same proof has the same bill, length and
+description size in one module or in three (a test compares them).
+
+### A theorem held by two modules
+
+Lean derives a definition's equation lemmas (`f.eq_1`, `f.eq_def`) in the module that first unfolds `f`, under
+`f`'s name. Two modules that unfold `f` and do not import each other each hold a copy, and Lean imports both:
+the same theorem. The service refused such a proof ("the candidate declares Candidate.Far.rows.eq_2 twice",
+attn-min2-ptl-3, round 1). Since policy v13 a second copy of a theorem with the same universe parameters and
+the same statement is skipped: the kernel replays the first, and everything that uses the name is checked
+against that one. A definition in two modules, or one name with two statements, is refused as before: there
+the copy a later stage reads would be the candidate's choice.
 
 ## Planned checkers (policy v9, 13 November 2026)
 
@@ -445,8 +555,9 @@ plan, is refused scoring, as is a plan over its bounds. Unplanned submissions ar
 The general layer is the checker, its soundness proof and everything they depend on. Beyond the closure
 check, the service enforces, as policy (recorded in the receipt's policy digest):
 
-- no reference to a protected constant other than `graph` and `task` from the general layer
-  (`acceptcheck score` rejects it; the closure check catches it in `D` first);
+- no reference to a protected constant other than `graph` and `task` (the network module's or the claim
+  module's) from the general layer (`acceptcheck score` rejects it; the closure check catches it in `D`
+  first);
 - a description-size budget: the size of the checker's computational closure (the checker and the
   definitions it uses, transitively through definitions and never through theorems: what it computes is
   a function of these bodies and of the interpreter), every node of every body counted 1, a numeral 1 per

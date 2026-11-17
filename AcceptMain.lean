@@ -131,6 +131,18 @@ def sameTrustedTheorem (kenv : Kernel.Environment) (ci : ConstantInfo) : Bool :=
   | some (.thmInfo t), .thmInfo c => t.levelParams == c.levelParams && t.type == c.type
   | _, _ => false
 
+/-- A second copy, in another module of the candidate, of a theorem the candidate already has: the same
+    universe parameters and the same statement. Lean generates the equation lemmas of a definition (`f.eq_1`,
+    `f.eq_def`) on demand, in whichever module first unfolds it, so two modules that unfold a definition of a
+    third and do not import each other each carry a copy (run attn-min2-ptl-3, 16 November 2026: a proof was
+    rejected for `Candidate.Far.rows.eq_2`, declared twice). The second copy changes nothing: the first is
+    replayed through the kernel, and every constant refers to it by name. It is left out of the replay; two
+    constants of one name that are not such copies are still refused. -/
+def sameCandidateTheorem (a b : ConstantInfo) : Bool :=
+  match a, b with
+  | .thmInfo x, .thmInfo y => x.levelParams == y.levelParams && x.type == y.type
+  | _, _ => false
+
 def runCheck (target cand : Name) (trusted : List Name) (oleans : List String) : IO UInt32 := do
   initSearchPath (← findSysroot)
   let imports := trusted.toArray.map fun m => { module := m : Import }
@@ -148,7 +160,8 @@ def runCheck (target cand : Name) (trusted : List Name) (oleans : List String) :
         return ← rejected s!"the candidate redeclares {ci.name}, a constant of the trusted modules"
       if ci.name.getRoot == `Challenge then
         return ← rejected s!"the candidate declares {ci.name}; the Challenge namespace is the service's"
-      if newConstants.contains ci.name then
+      if let some first := newConstants.get? ci.name then
+        if sameCandidateTheorem first ci then continue
         return ← rejected s!"the candidate declares {ci.name} twice"
       newConstants := newConstants.insert ci.name ci
       count := count + 1
@@ -238,7 +251,8 @@ def instanceTypePlanned (D weights cert plan : Name) (n bill : Nat) : Expr :=
 
 /-- The candidate's constants, by name: `none` with a reason if one is a trusted constant's name (other than an
     identical copy of a trusted theorem, `sameTrustedTheorem`, which is left out), is in the `Challenge`
-    namespace, or is declared twice. -/
+    namespace, or is declared twice (other than a second copy of the same theorem, `sameCandidateTheorem`,
+    which is left out). -/
 def candidateConstants (kenv : Kernel.Environment) (oleans : List String) :
     IO (Except String (Std.HashMap Name ConstantInfo)) := do
   let mut cs : Std.HashMap Name ConstantInfo := {}
@@ -249,7 +263,8 @@ def candidateConstants (kenv : Kernel.Environment) (oleans : List String) :
         return .error s!"the candidate redeclares {ci.name}, a constant of the trusted modules"
       if ci.name.getRoot == `Challenge then
         return .error s!"the candidate declares {ci.name}; the Challenge namespace is the service's"
-      if cs.contains ci.name then
+      if let some first := cs.get? ci.name then
+        if sameCandidateTheorem first ci then continue
         return .error s!"the candidate declares {ci.name} twice"
       cs := cs.insert ci.name ci
   return .ok cs
@@ -392,10 +407,21 @@ def challenge (kenv : Kernel.Environment) (name : Name) (type : Expr) (value : N
   | .error e => return .error s!"the kernel rejects {name} := {value}: {← (e.toMessageData {}).toString}"
   | .ok kenv' => return .ok kenv'
 
+/-- `graph` or `task` of a protected module: `Protected.<module>.graph`, `Protected.<module>.task`. Since
+    17 November 2026 the network has a module of its own (`Protected.N_<network>`) with the same definitions
+    as the claim's, so the rule is about the namespace, not about one module's name. A constant of that name
+    that the candidate declares itself is one of the candidate's: it is followed, and what it uses is
+    checked like the rest (`runClosure`, `runScore`). -/
+def protectedGraphOrTask (n : Name) : Bool :=
+  match n with
+  | .str (.str (.str .anonymous "Protected") _) s => s == "graph" || s == "task"
+  | _ => false
+
 /-- The protected constants the general layer may use: the graph and the task (the statement of
-    soundness mentions them); not the weights, the certificate, the claim or the target. -/
-def generalMayUse (prot : Name) (n : Name) : Bool :=
-  !(prot.isPrefixOf n) || n == prot ++ `graph || n == prot ++ `task
+    soundness mentions them); not the weights, the certificate, the plan, the claim or the target, of
+    whichever protected module. -/
+def generalMayUse (_prot : Name) (n : Name) : Bool :=
+  n.getRoot != `Protected || protectedGraphOrTask n
 
 def runScore (prot D sound inst : Name) (n bill : Nat) (trusted : List Name) (oleans : List String)
     (planned : Bool := false) : IO UInt32 := do
@@ -416,7 +442,7 @@ def runScore (prot D sound inst : Name) (n bill : Nat) (trusted : List Name) (ol
     let some ci := cs.get? g | continue
     for m in ci.getUsedConstantsAsSet.toList do
       if !generalMayUse prot m then
-        return ← rejected s!"the general layer ({g}) uses the protected constant {m}; only {prot}.graph and {prot}.task may appear outside the instance"
+        return ← rejected s!"the general layer ({g}) uses the protected constant {m}; only a protected module's graph and task ({prot}.graph, {prot}.task, or the network module's) may appear outside the instance"
   let generalMap : Std.HashMap Name ConstantInfo := general.foldl (fun m g => match cs.get? g with
     | some ci => m.insert g ci | none => m) {}
   let restMap : Std.HashMap Name ConstantInfo := cs.fold (fun m k v => if general.contains k then m else m.insert k v) {}
@@ -476,7 +502,7 @@ def scorePrecheck (kenv : Kernel.Environment) (cs : Std.HashMap Name ConstantInf
     let some ci := cs.get? g | continue
     for m in ci.getUsedConstantsAsSet.toList do
       if !generalMayUse prot m then
-        return some s!"the general layer ({g}) uses the protected constant {m}; only {prot}.graph and {prot}.task may appear outside the instance"
+        return some s!"the general layer ({g}) uses the protected constant {m}; only a protected module's graph and task ({prot}.graph, {prot}.task, or the network module's) may appear outside the instance"
   return none
 
 def runCheckScore (target cand prot D sound inst : Name) (n bill : Nat) (trusted : List Name) (oleans : List String)
@@ -582,7 +608,7 @@ partial def primitiveProjections (e : Expr) (acc : Array (Name × Nat) := #[]) :
   | .mdata _ b => primitiveProjections b acc
   | _ => acc
 
-def runClosure (root : Name) (allowPath : String) (prot : Name) (trusted : List Name) (oleans : List String) : IO UInt32 := do
+def runClosure (root : Name) (allowPath : String) (_prot : Name) (trusted : List Name) (oleans : List String) : IO UInt32 := do
   initSearchPath (← findSysroot)
   let imports := trusted.toArray.map fun m => { module := m : Import }
   let env ← importModules imports {} (trustLevel := 0)
@@ -626,7 +652,7 @@ def runClosure (root : Name) (allowPath : String) (prot : Name) (trusted : List 
         match kenv.find? n with
         | some (.thmInfo _) => continue
         | _ =>
-          if !allow.contains n && n != prot ++ `graph && n != prot ++ `task then
+          if !allow.contains n && !protectedGraphOrTask n then
             offending := offending.push n
   let sorted := offending.qsort Name.lt
   -- the description size, measured as `score` measures it (the same closure and the same weights), so that a

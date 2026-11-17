@@ -1,0 +1,5 @@
+{"schema": "open-lane-candidate-v1", "candidate_id": "max2-tiny-split", "model": "tests/max2_tiny",
+ "network": "max2_tiny-v8-s0", "claimed_count": 64, "theorem": "Candidate.SplitTop.performance",
+ "modules": ["Candidate/SplitGeneral.lean", "Candidate/SplitFacts.lean", "Candidate/SplitTop.lean"],
+ "scored": {"checker": "Candidate.SplitGeneral.D", "sound": "Candidate.SplitGeneral.D_sound",
+            "instance": "Candidate.SplitTop.D_instance", "certificate": [], "claimed_bill": 4032}}

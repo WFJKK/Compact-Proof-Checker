@@ -11,6 +11,7 @@ compiles Lean against Mathlib, so the file takes a few minutes. The work folder 
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -252,7 +253,9 @@ def test_the_box_blocks_writes_outside_it(work, tmp_path):
 
 
 def test_a_tampered_protected_module_is_caught(work, tmp_path):
-    """`acceptcheck protected` compares the module with the network file: a changed weight is a mismatch."""
+    """`acceptcheck protected` compares the claim's module with the network file: a changed weight is a mismatch.
+    The claim's module is the trusted one, and it holds its constants itself, in the text it always had; the
+    network's own module (17 November 2026) holds the same definitions for a candidate's modules to import."""
     sys.path.insert(0, str(HERE))
     import accept
     import make_protected
@@ -261,6 +264,10 @@ def test_a_tampered_protected_module_is_caught(work, tmp_path):
     net_json = accept.export_network(REPO, "tests/max2_tiny", "max2_tiny-v8-s0", work)
     net = json.loads(net_json.read_text())
     name, src = make_protected.render(net, 64)
+    (net_name, net_src), (claim_name, claim_src) = make_protected.render_all(net, 64)
+    assert net_name == "N_max2_tiny_v8_s0" and (claim_name, claim_src) == (name, src) and "import Protected" not in src
+    block = src[src.index("/-- The network's graph"):src.index("/-- The certificate")]
+    assert "dyadic 1505767040" in block and block in net_src  # the same definitions, text for text
     bad = src.replace("dyadic 1505767040", "dyadic 1505767041", 1)
     assert bad != src
     ws = tmp_path / "tampered"
@@ -391,6 +398,15 @@ def test_the_general_layer_may_not_touch_the_weights_not_proving_anti_hiding(wor
     assert r["status"] == "accepted", r["reason"]
     s = r["scoring"]
     assert s["status"] == "refused" and "weights" in s["reason"], s
+    # the same for the weights of the network's own module (the same definition under a name no claim changes):
+    # only a protected module's graph and task are the general layer's to use
+    first = "import Protected.N_max2_tiny_v8_s0_c64\n"
+    assert "weights.length" in src and src.startswith(first)
+    other = "import Protected.N_max2_tiny_v8_s0\n" + src.replace("weights.length", "Protected.N_max2_tiny_v8_s0.weights.length")
+    r = submit(scored_variant(tmp_path, "uses-network-weights", other), work)
+    assert r["status"] == "accepted", r["reason"]
+    s = r["scoring"]
+    assert s["status"] == "refused" and "Protected.N_max2_tiny_v8_s0.weights" in s["reason"], s
 
 
 def test_a_copy_of_the_weights_as_literals_is_refused_scoring_not_proving_anti_hiding(work, tmp_path):
@@ -440,7 +456,143 @@ def test_a_checker_may_compare_a_list_with_the_empty_list(work, tmp_path):
     assert r["status"] == "accepted", r["reason"]
     s = r["scoring"]
     assert s["status"] == "scored", s
-    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v12"
+    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v13"
+
+
+# ---- the protected modules: the network apart from the claim (17 November 2026) --------------------------------
+SPLIT = PROJECT / "examples" / "open_lane" / "max2_tiny_split"
+
+
+def test_a_proof_split_over_the_network_and_the_claim_is_scored_as_the_one_module_proof_is(work):
+    """examples/open_lane/max2_tiny_split: the scored brute-force proof in three modules. The checker, its
+    soundness proof and the decided fact import the network's module alone (Protected.N_max2_tiny_v8_s0: graph,
+    weights, task); only the last module names the claim's (Protected.N_max2_tiny_v8_s0_c64), whose constants
+    have the same definitions. The kernel accepts the soundness and instance statements the service writes with
+    the claim module's names, unfolding both: the same count, bill, length and description size as the proof in
+    one module."""
+    one = submit(SCORED, work)
+    r = submit(SPLIT, work)
+    assert r["status"] == "accepted" and r["certified_count"] == 64, r["reason"]
+    s = r["scoring"]
+    assert s["status"] == "scored", s
+    assert (s["bill"], s["length"]) == (64 * 63, one["scoring"]["length"]) and s["description_size"] <= one["scoring"]["description_size"]
+    step = next(x for x in r["steps"] if x["step"] == "protected")
+    assert step["module"] == "Protected.N_max2_tiny_v8_s0_c64" and step["network_module"] == "Protected.N_max2_tiny_v8_s0"
+
+
+def test_facts_about_the_network_are_not_compiled_again_when_the_claim_changes(work, tmp_path):
+    """What the split is for. In run attn-min2-ptl-3 raising the claimed count renamed the protected module, and
+    every module of the proof was edited and compiled again (about 20 compiles). Here the general layer and the
+    fact are compiled once, against claim 64; then a module for claim 60 is compiled against them as they are:
+    the claim's module has another name, the network's the same, and the fact's object file is untouched."""
+    ws = tmp_path / "ws"
+    shutil.copytree(SPLIT / "Candidate", ws / "Candidate")
+    (ws / "Candidate" / "SplitTop.lean").unlink()
+
+    def compile_(rel: str, claimed: int) -> dict:
+        r = subprocess.run([sys.executable, "-B", str(HERE / "accept.py"), "compile", str(ws), rel, "--repo", str(REPO),
+                            "--work", str(work), "--model", "tests/max2_tiny", "--network", "max2_tiny-v8-s0",
+                            "--claimed", str(claimed)], capture_output=True, text=True, timeout=1800)
+        out = json.loads(r.stdout)
+        assert out["ok"] is True, out
+        return out
+
+    a = compile_("Candidate/SplitGeneral.lean", 64)
+    b = compile_("Candidate/SplitFacts.lean", 64)
+    assert a["protected_module"] == b["protected_module"] == "Protected.N_max2_tiny_v8_s0_c64"
+    assert a["network_module"] == "Protected.N_max2_tiny_v8_s0"
+    fact = ws / "out" / "Candidate" / "SplitFacts.olean"
+    before = (hashlib.sha256(fact.read_bytes()).hexdigest(), fact.stat().st_mtime_ns)
+    (ws / "Candidate" / "SplitTop60.lean").write_text(
+        "import Protected.N_max2_tiny_v8_s0_c60\nimport Candidate.SplitFacts\n\nnamespace Candidate.SplitTop60\n\n"
+        "open CompactCheck Candidate.SplitGeneral\n\n"
+        "theorem performance : Protected.N_max2_tiny_v8_s0_c60.Target := by\n"
+        "  show 60 ≤ numCorrect Protected.N_max2_tiny_v8_s0.graph Protected.N_max2_tiny_v8_s0.weights Protected.N_max2_tiny_v8_s0.task\n"
+        "  obtain ⟨cost, h⟩ := CostM.exec_of_billed Candidate.SplitFacts.D_run\n"
+        "  exact Nat.le_trans (by decide) (D_sound _ _ 64 cost h)\n\nend Candidate.SplitTop60\n")
+    c = compile_("Candidate/SplitTop60.lean", 60)
+    assert c["protected_module"] == "Protected.N_max2_tiny_v8_s0_c60" and c["network_module"] == a["network_module"]
+    assert (hashlib.sha256(fact.read_bytes()).hexdigest(), fact.stat().st_mtime_ns) == before
+    # the network's module was compiled once for both claims
+    assert sorted(p.name for p in (work / "protected" / "parts").iterdir() if p.name.startswith("N_max2_tiny_v8_s0")) == ["N_max2_tiny_v8_s0"]
+
+
+def split_with(tmp_path: Path, name: str, extra: dict[str, str], imports: list[str]) -> Path:
+    """The split example with more modules (`extra`: file name to source), of which `imports` are imported by
+    the module that proves the target."""
+    d = variant(tmp_path, name, base=SPLIT)
+    for rel, src in extra.items():
+        (d / "Candidate" / rel).write_text(src)
+    top = d / "Candidate" / "SplitTop.lean"
+    text = top.read_text()
+    assert "import Candidate.SplitFacts\n" in text
+    top.write_text(text.replace("import Candidate.SplitFacts\n", "import Candidate.SplitFacts\n" + "".join(f"import Candidate.{m}\n" for m in imports), 1))
+    m = json.loads((d / "manifest.json").read_text())
+    m["modules"] += [f"Candidate/{rel}" for rel in extra]
+    (d / "manifest.json").write_text(json.dumps(m))
+    return d
+
+
+EQ_A = "namespace Candidate.EqA\n\ndef rows : List Nat → Nat\n  | [] => 0\n  | x :: xs => x + rows xs\n\nend Candidate.EqA\n"
+
+
+def eq_user(name: str, xs: str, total: int) -> str:
+    return (f"import Candidate.EqA\n\nnamespace Candidate.{name}\n\ntheorem t : Candidate.EqA.rows {xs} = {total} := by\n"
+            f"  simp [Candidate.EqA.rows]\n\nend Candidate.{name}\n")
+
+
+def test_two_modules_that_each_derive_the_same_equation_lemma_are_one_proof(work, tmp_path):
+    """Lean derives a definition's equation lemmas (`rows.eq_1`, `rows.eq_def`) in the module that first unfolds
+    it, under the definition's name. Two modules that unfold `rows` and do not import each other each hold a
+    copy; Lean imports both (the same theorem). Until policy v13 the service refused such a proof, "the
+    candidate declares Candidate.EqA.rows.eq_def twice" (run attn-min2-ptl-3, round 1, `Candidate.Far.rows.eq_2`:
+    a false alarm that cost the agent a submission). A second copy with the same statement adds nothing: the
+    kernel replays the first."""
+    d = split_with(tmp_path, "eq-dup", {"EqA.lean": EQ_A, "EqB.lean": eq_user("EqB", "[1, 2]", 3), "EqC.lean": eq_user("EqC", "[2, 2]", 4)},
+                   ["EqB", "EqC"])
+    r = submit(d, work)
+    assert r["status"] == "accepted", r["reason"]
+    assert r["scoring"]["status"] == "scored", r["scoring"]
+
+
+def test_one_name_with_two_statements_is_still_refused(work, tmp_path):
+    """What the rule is for: two modules that declare one name with different statements. Lean refuses to import
+    both into one module, so only one is imported by the proof; the other is listed. Which of the two a later
+    stage reads under that name would be the candidate's choice, so the proof is refused, as before."""
+    one = "namespace Candidate.Shared\n\ntheorem t : 1 + 1 = 2 := rfl\n\nend Candidate.Shared\n"
+    two = "namespace Candidate.Shared\n\ntheorem t : 2 + 2 = 4 := rfl\n\nend Candidate.Shared\n"
+    d = split_with(tmp_path, "two-statements", {"SharedOne.lean": one, "SharedTwo.lean": two}, ["SharedOne"])
+    r = submit(d, work)
+    assert r["status"] == "rejected" and "declares Candidate.Shared.t twice" in r["reason"], r["reason"]
+
+
+def test_a_definition_declared_in_two_modules_is_still_refused(work, tmp_path):
+    """Only a second copy of a theorem with the same statement is let through. A definition is not: two
+    definitions of one name with one type can differ in what they compute."""
+    one = "namespace Candidate.Shared\n\ndef k : Nat := 1\n\nend Candidate.Shared\n"
+    two = "namespace Candidate.Shared\n\ndef k : Nat := 2\n\nend Candidate.Shared\n"
+    d = split_with(tmp_path, "two-definitions", {"SharedOne.lean": one, "SharedTwo.lean": two}, ["SharedOne"])
+    r = submit(d, work)
+    assert r["status"] == "rejected" and "declares Candidate.Shared.k twice" in r["reason"], r["reason"]
+
+
+def test_the_protected_modules_of_a_network_of_width_32_compile(work):
+    """attn-min2-v64-s0: 8,257 weights, its embedding and unembedding 2,048 entries each. A literal that long
+    needs more than Lean's default recursion depth; until 17 November 2026 the protected module of such a
+    network did not compile ("maximum recursion depth has been reached"), so the open lane stopped at width 8.
+    The module now sets the depth it needs for its weights (and lifts the compiler's step limit, which tensors
+    of 4,096 entries run into: attn-min2-v128-s0 builds too, in about 140 s, not run here). Both modules are
+    built and the claim's is checked against the network file."""
+    sys.path.insert(0, str(HERE))
+    import accept
+    sys.path.pop(0)
+    accept._repo = REPO
+    net_json = accept.export_network(REPO, "models/attn-min2", "attn-min2-v64-s0", work)
+    net = json.loads(net_json.read_text())
+    assert max(len(w["ints"]) for w in net["weights"]) == 2048
+    r = accept.build_protected(net_json, 100, work, accept.lean_binary(), accept.lean_path(), accept.box_mode("hardened"))
+    assert r["modules"] == ["Protected.N_attn_min2_v64_s0", "Protected.N_attn_min2_v64_s0_c100"] and r["domain"] == 4096
+    assert Path(r["olean"]).is_file() and (Path(r["lean_path_dir"]) / "Protected" / "N_attn_min2_v64_s0.olean").is_file()
 
 
 # ---- planned checkers (policy v9) ---------------------------------------------------------------------------
@@ -477,7 +629,7 @@ def test_a_planned_checker_is_scored_and_its_plan_is_free(work):
     assert s["bill"] == 60 * 63 and s["read"] == 0 and s["length"] == s["bill"] + s["extract"] + s["read"]
     assert s["plan_entries"] == 64 and s["description_size"] <= s["size_budget"]
     assert s["plan_bits"] == 184 <= s["plan_bits_budget"] == s["weight_bits"] // 4  # 60 ones, 4 zeros: 60 * 3 + 4
-    assert r["policy_version"] == "open-lane-policy-v12"
+    assert r["policy_version"] == "open-lane-policy-v13"
 
 
 def test_a_planned_soundness_proof_must_hold_for_every_plan(work, tmp_path):
@@ -542,6 +694,21 @@ def test_an_auxiliary_lemma_is_accepted_without_a_count(work, tmp_path):
     assert "numCorrect" in r["statement"] and set(r["axioms"]) <= {"propext", "Classical.choice", "Quot.sound"}
     r = submit(variant(tmp_path, "aux-def", manifest={"kind": "auxiliary", "theorem": "Candidate.Max2Tiny.D"}), work)
     assert r["status"] == "rejected" and "not a theorem" in r["reason"]
+
+
+def test_the_kernel_runs_the_networks_graph_through_the_kernels_semantics(work):
+    """examples/open_lane/max2_tiny_kernel_run: a lemma in which the kernel evaluates the specification's
+    `semGraph` on the network's weights and an input. It rewrites with `semGraph_eqK`
+    (CompactCheck/SemanticsKernel.lean) and decides the statement about `semGraphK`, which builds every tensor
+    from a list and reads it through a tree; the statement the service records is the one about `semGraph`. The
+    specification's own definitions build and read arrays entry by entry, which the kernel, for which an array
+    is a list, pays for with the square of their size (docs/COUNTED.md, "Running the specification in the
+    kernel")."""
+    r = submit(PROJECT / "examples" / "open_lane" / "max2_tiny_kernel_run", work)
+    assert r["status"] == "accepted", r["reason"]
+    assert r["claim_kind"] == "auxiliary" and r["certified_count"] is None
+    assert "CompactCheck.semGraph" in r["statement"] and "semGraphK" not in r["statement"]
+    assert set(r["axioms"]) <= {"propext", "Classical.choice", "Quot.sound"}
 
 
 def test_a_scored_proof_is_marked_kernel_checked(work):
@@ -1158,7 +1325,7 @@ def test_a_checker_may_build_a_graph_of_the_linear_family_and_run_single_on_it(w
     assert r["status"] == "accepted" and r["certified_count"] == 64, r["reason"]
     s = r["scoring"]
     assert s["status"] == "scored", s
-    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v12"
+    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v13"
 
 
 def test_weight_sizes_are_read_for_free(work, tmp_path):

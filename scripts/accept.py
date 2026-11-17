@@ -14,10 +14,14 @@ What happens, in order (every step's outcome is in the receipt):
 
 1. The manifest is checked: types, a claimed count that is a natural number, module paths under Candidate/
    with identifier names, no symbolic links. Module files may import only Candidate.* (among the submitted
-   modules), the protected module, CompactCheck.* and Mathlib.*.
+   modules), the submission's protected modules, CompactCheck.* and Mathlib.*.
 2. The network is exported from the pipeline's zoo with scripts/export_network.py (cached by network), and
-   the protected module Protected.N_<network>_c<claimed> is written by scripts/make_protected.py and compiled;
-   `acceptcheck protected` checks its constants against the network file with the checker's own reader.
+   the protected modules are written by scripts/make_protected.py and compiled: the claim's,
+   Protected.N_<network>_c<claimed>..., with the graph, the weights, the task and the target, and beside it
+   the same definitions in modules whose names no claim changes: the network's, Protected.N_<network> (one
+   per network, compiled once), and the certificate's and the plan's when there are any (named by their
+   content). `acceptcheck protected` checks the claim module's constants against the network file with the
+   checker's own reader. A candidate's facts about the weights can import the network's module alone.
 3. Each candidate module is compiled with `lean` in a box (Landlock on Linux: no network, reads only the
    toolchain, the Lean project, the workspace and system files, writes only the workspace's out/ and tmp/;
    on macOS with --mode seatbelt, a sandbox-exec profile with the same reads inside the home folder, the
@@ -134,7 +138,18 @@ COST_MODEL = "cost-v3"  # the prices (CountedCheck.lean, core/check/cost.py of t
 # v4 (22 October, after pilot 2 and review round 7): a free weightSize read, graph constructors of the
 # linear family and two audited match-compiler constants on the allowlist. v3 (21 October): language
 # version 4 and the description-size budget. Recorded in every receipt and in the policy digest.
-POLICY_VERSION = "open-lane-policy-v12"
+# v13 (17 November 2026): the network has a protected module of its own. The claim's module is what it was,
+# text for text, and every statement the service writes is the one it wrote before. Beside it the service now
+# builds Protected.N_<network> (graph, weights, task) and, for a certificate and a plan, modules named by
+# their content, with the same definitions. A candidate's modules that import only those are compiled once
+# for a network, not once for every claimed count, certificate and plan (run attn-min2-ptl-3 spent about 20
+# compiles of a round on the renames); a fact about the network module's weights is a fact about the claim
+# module's, since the kernel unfolds both to the same term. The general layer may use `graph` and `task` of
+# either module and no other protected constant, as before. And a theorem that two candidate modules each
+# hold with one statement (Lean derives a definition's equation lemmas in every module that first unfolds it)
+# is one theorem, no longer "declared twice"; a definition, or one name with two statements, is refused as
+# before.
+POLICY_VERSION = "open-lane-policy-v13"
 ASSURANCE = "kernel_checked_instance"  # a scored result's count and bill are both kernel-checked, never executed
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 IMPORT_LINE = re.compile(r"^\s*import\s+([A-Za-z_][A-Za-z0-9_.]*)\s*$")
@@ -471,8 +486,9 @@ def compile_module(ws: Path, root: Path, module: str, src: Path, lean: Path, lp:
     return res
 
 
-def check_imports(text: str, module: str, modules: set[str], protected: str) -> list[str]:
-    """The module's imports, each checked against the allowlist. Imports must come first, as in Lean."""
+def check_imports(text: str, module: str, modules: set[str], protected: list[str]) -> list[str]:
+    """The module's imports, each checked against the allowlist (`protected`: the submission's protected
+    modules, the network's and the claim's among them). Imports must come first, as in Lean."""
     imports = []
     for line in text.splitlines():
         s = line.strip()
@@ -487,10 +503,10 @@ def check_imports(text: str, module: str, modules: set[str], protected: str) -> 
                 raise Reject(f"{module} imports {name}, which is not a submitted module")
             if name == module:
                 raise Reject(f"{module} imports itself")
-        elif name == protected or name.startswith(TRUSTED_PREFIXES):
+        elif name in protected or name.startswith(TRUSTED_PREFIXES):
             pass
         else:
-            raise Reject(f"{module} imports {name}; allowed: the submitted Candidate modules, {protected}, "
+            raise Reject(f"{module} imports {name}; allowed: the submitted Candidate modules, {', '.join(protected)}, "
                          "CompactCheck.* and Mathlib.*")
         imports.append(name)
     return imports
@@ -594,8 +610,15 @@ def read_manifest(cdir: Path) -> dict:
 # ---- the protected module ---------------------------------------------------------------------------
 def build_protected(net_json: Path, claimed: int, work: Path, lean: Path, lp: list[str], mode: str,
                     cert: list | None = None, plan: list | None = None) -> dict:
-    """Write, compile and verify the protected module; returns {module, olean, ...}. Cached by content. With a
-    plan (a planned checker's), the module also has the constant `plan`."""
+    """Write, compile and verify the protected modules (scripts/make_protected.py): the claim's, which is the
+    trusted one and is checked against the network file, and beside it the network's, the certificate's and the
+    plan's when there are any, which hold the same definitions under names that do not change with the claim.
+    Each of those three is compiled once, in a folder of its own, and cached by content; the claim's folder gets
+    a copy of their object files beside its own, because Lean looks for every module of `Protected` in the first
+    folder of its search path that has that package. So one folder (lean_path_dir) holds all a candidate may
+    import, and a candidate's module that imports the network's module alone stays compiled when the claim
+    changes. Returns {module, olean, lean_path_dir: the claim module's; modules: every module's name;
+    network_module; cached; domain}. With a plan (a planned checker's), the claim's module also has `plan`."""
     sys.path.insert(0, str(HERE))
     try:
         import make_protected
@@ -603,41 +626,63 @@ def build_protected(net_json: Path, claimed: int, work: Path, lean: Path, lp: li
         sys.path.pop(0)
     net = json.loads(net_json.read_text())
     try:
-        name, src = make_protected.render(net, claimed, cert, plan)
+        parts = make_protected.render_all(net, claimed, cert, plan)
     except make_protected.ProtectedError as exc:
         if "not supported" in str(exc):
             raise Unsupported(str(exc))
         raise Reject(str(exc))
-    module = f"Protected.{name}"
     pdir = work / "protected"
+    names = [f"Protected.{name}" for name, _ in parts]
+    name, src = parts[-1]
     ws = pdir / name
     olean = ws / "out" / "Protected" / f"{name}.olean"
     stamp = ws / "verified.json"
-    if olean.exists() and stamp.exists() and json.loads(stamp.read_text()).get("source_sha256") == sha256_text(src):
-        return {"module": module, "olean": str(olean), "lean_path_dir": str(ws / "out"), "cached": True,
-                "domain": json.loads(stamp.read_text())["domain"]}
+    out = {"module": names[-1], "olean": str(olean), "lean_path_dir": str(ws / "out"), "lean_path_dirs": [str(ws / "out")],
+           "modules": names, "network_module": names[0]}
+    # the stamp is of every module's source: the folder is rebuilt when any of them changes
+    key = sha256_text("\n".join(text for _, text in parts))
+    if olean.exists() and stamp.exists() and json.loads(stamp.read_text()).get("source_sha256") == key:
+        return {**out, "cached": True, "domain": json.loads(stamp.read_text())["domain"]}
+
+    def compiled(dws: Path, dname: str, dsrc: str) -> None:
+        srcp = dws / "Protected" / f"{dname}.lean"
+        srcp.parent.mkdir(parents=True, exist_ok=True)
+        srcp.write_text(dsrc)
+        res = compile_module(dws, dws, f"Protected.{dname}", srcp, lean, lp, mode)
+        if res["timed_out"]:
+            raise Infra(f"compiling the protected module Protected.{dname} timed out")
+        if res["rc"] != 0:
+            raise Infra(f"the protected module Protected.{dname} does not compile: {res['stdout'][-1500:]}{res['stderr'][-500:]}")
+
+    parts_dir = pdir / "parts"  # the modules that do not change with the claim, each compiled once
+    ready = []
+    for dname, dsrc in parts[:-1]:
+        dws = parts_dir / dname
+        dolean = dws / "out" / "Protected" / f"{dname}.olean"
+        dstamp = dws / "compiled.json"
+        if not (dolean.exists() and dstamp.exists() and json.loads(dstamp.read_text()).get("source_sha256") == sha256_text(dsrc)):
+            shutil.rmtree(dws, ignore_errors=True)
+            compiled(dws, dname, dsrc)
+            dstamp.write_text(json.dumps({"source_sha256": sha256_text(dsrc)}))
+        ready.append((dname, dolean))
     shutil.rmtree(ws, ignore_errors=True)
-    (ws / "Protected").mkdir(parents=True)
-    srcp = ws / "Protected" / f"{name}.lean"
-    srcp.write_text(src)
+    (ws / "out" / "Protected").mkdir(parents=True)
+    for dname, dolean in ready:
+        shutil.copyfile(dolean, ws / "out" / "Protected" / f"{dname}.olean")
+        (ws / "Protected").mkdir(exist_ok=True)
+        shutil.copyfile(dolean.parents[2] / "Protected" / f"{dname}.lean", ws / "Protected" / f"{dname}.lean")
     (ws / "cert.json").write_text(json.dumps(cert or []))
     if plan is not None:
         (ws / "plan.json").write_text(json.dumps(plan))
-    res = compile_module(ws, ws, module, srcp, lean, lp, mode)
-    if res["timed_out"]:
-        raise Infra("compiling the protected module timed out")
-    if res["rc"] != 0:
-        raise Infra(f"the protected module does not compile: {res['stdout'][-1500:]}{res['stderr'][-500:]}")
+    compiled(ws, name, src)
     env = box_env(ws, lean, lp)
-    chk = run_boxed(ws, [str(acceptcheck_binary()), "protected", str(net_json), module, str(olean)], env, mode,
+    chk = run_boxed(ws, [str(acceptcheck_binary()), "protected", str(net_json), names[-1], str(olean)], env, mode,
                     CHECK_TIMEOUT_S, [str(toolchain_root(lean)), str(LEAN_PROJECT), str(net_json)])
     last = last_json(chk["stdout"])
     if chk["rc"] != 0 or not last or last.get("status") != "ok":
         raise Infra(f"the protected module does not match the network file: {last or chk['stderr'][-800:]}")
-    stamp.write_text(json.dumps({"source_sha256": sha256_text(src), "domain": last["domain"],
-                                 "network": last["network"]}))
-    return {"module": module, "olean": str(olean), "lean_path_dir": str(ws / "out"), "cached": False,
-            "domain": last["domain"]}
+    stamp.write_text(json.dumps({"source_sha256": key, "domain": last["domain"], "network": last["network"]}))
+    return {**out, "cached": False, "domain": last["domain"]}
 
 
 def last_json(text: str) -> dict | None:
@@ -690,8 +735,9 @@ def submit(cdir: Path, repo: Path, work: Path, want_mode: str) -> dict:
         prot = build_protected(net_json, manifest["claimed_count"], work, lean, lp, mode,
                                scored["certificate"] if scored else None, scored.get("plan") if scored else None)
         receipt["domain_size"] = prot["domain"]
-        receipt["steps"].append({"step": "protected", "module": prot["module"], "cached": prot["cached"]})
-        deps = {m: check_imports(p.read_text(), m, set(modules), prot["module"]) for m, p in modules.items()}
+        receipt["steps"].append({"step": "protected", "module": prot["module"], "network_module": prot["network_module"],
+                                 "cached": prot["cached"]})
+        deps = {m: check_imports(p.read_text(), m, set(modules), prot["modules"]) for m, p in modules.items()}
         order = order_modules(deps)
         # the workspace
         ws = work / "submissions" / f"{manifest['candidate_id']}-{int(t0)}"
@@ -702,7 +748,7 @@ def submit(cdir: Path, repo: Path, work: Path, want_mode: str) -> dict:
             dst = ws / (m.replace(".", "/") + ".lean")
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(p, dst)
-        lp_all = lp + [prot["lean_path_dir"]]
+        lp_all = lp + prot["lean_path_dirs"]
         oleans = []
         for m in order:
             # without the kernel's check here: acceptcheck replays every constant through the kernel below, and an
@@ -941,7 +987,7 @@ def scoring_preview(ws: Path, module: str, checker: str, prot: dict, net_json: P
     (ws / "tmp").mkdir(exist_ok=True)
     allowlist = ws / "tmp" / "allowlist.txt"
     allowlist.write_text(allowlist_text())
-    lp_all = lp + [prot["lean_path_dir"], str(ws / "out")]
+    lp_all = lp + prot["lean_path_dirs"] + [str(ws / "out")]
     cmd = [str(acceptcheck_binary()), "closure", checker, str(allowlist), prot["module"]] + trusted + ["--"] + oleans
     chk = run_boxed(ws, cmd, box_env(ws, lean, lp_all), mode, CHECK_TIMEOUT_S,
                     [str(toolchain_root(lean)), str(LEAN_PROJECT)] + lp_all)
@@ -990,11 +1036,12 @@ def compile_for_development(ws: Path, rel: str, repo: Path, model: str, network:
         return {"ok": False, "error": str(exc)}
     module = "Candidate." + rel[len("Candidate/"):-len(".lean")].replace("/", ".")
     (ws / "out").mkdir(exist_ok=True)
-    res = compile_module(ws, ws, module, src, lean, lp + [prot["lean_path_dir"], str(ws / "out")], mode)
+    res = compile_module(ws, ws, module, src, lean, lp + prot["lean_path_dirs"] + [str(ws / "out")], mode)
     text = (res["stdout"] + res["stderr"]).strip()
     ok = res["rc"] == 0 and not res["timed_out"]
     out = {"ok": ok, "timed_out": res["timed_out"], "module": module,
-           "protected_module": prot["module"], "messages": text, "seconds": round(res["seconds"], 1)}
+           "protected_module": prot["module"], "network_module": prot["network_module"],
+           "protected_modules": prot["modules"], "messages": text, "seconds": round(res["seconds"], 1)}
     if checker and ok:
         try:
             out["scoring_preview"] = scoring_preview(ws, module, checker, prot, net_json, lean, lp, mode, plan)
