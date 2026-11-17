@@ -285,6 +285,7 @@ def test_the_scored_proof_is_verified_and_scored(work):
     assert s["status"] == "scored", s["reason"]
     assert s["bill"] == 64 * 63 and s["read"] == 0 and s["extract"] == 80
     assert s["length"] == s["bill"] + s["extract"] + s["read"]
+    assert s["measured_bill"] == s["bill"] and s["measured_length"] == s["length"]  # what the kernel verified
     assert s["description_size"] <= s["size_budget"] and s["general_kernel_ms"] <= s["general_kernel_budget_ms"]
     assert set(s["axioms"]) <= {"propext", "Classical.choice", "Quot.sound"}
     # one replay verifies and scores (check-score), after the closure check, which needs none
@@ -406,6 +407,9 @@ def test_a_copy_of_the_weights_as_literals_is_refused_scoring_not_proving_anti_h
     s = r["scoring"]
     assert s["status"] == "refused" and "description size" in s["reason"], s
     assert s["description_size"] >= copy_bound(nums)
+    # refused by a budget, after the kernel verified the instance: no score, and the measurement is kept (v12)
+    assert s["bill"] is None and s["length"] is None
+    assert s["measured_bill"] == 64 * 63 and s["measured_length"] == 64 * 63 + s["extract"] + s["read"]
 
 
 def test_a_checker_outside_the_counted_language_is_refused_scoring(work, tmp_path):
@@ -436,7 +440,7 @@ def test_a_checker_may_compare_a_list_with_the_empty_list(work, tmp_path):
     assert r["status"] == "accepted", r["reason"]
     s = r["scoring"]
     assert s["status"] == "scored", s
-    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v11"
+    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v12"
 
 
 # ---- planned checkers (policy v9) ---------------------------------------------------------------------------
@@ -472,7 +476,8 @@ def test_a_planned_checker_is_scored_and_its_plan_is_free(work):
     assert s["status"] == "scored", s
     assert s["bill"] == 60 * 63 and s["read"] == 0 and s["length"] == s["bill"] + s["extract"] + s["read"]
     assert s["plan_entries"] == 64 and s["description_size"] <= s["size_budget"]
-    assert r["policy_version"] == "open-lane-policy-v11"
+    assert s["plan_bits"] == 184 <= s["plan_bits_budget"] == s["weight_bits"] // 4  # 60 ones, 4 zeros: 60 * 3 + 4
+    assert r["policy_version"] == "open-lane-policy-v12"
 
 
 def test_a_planned_soundness_proof_must_hold_for_every_plan(work, tmp_path):
@@ -503,8 +508,17 @@ def test_a_planned_soundness_proof_must_hold_for_every_plan(work, tmp_path):
 
 
 def test_a_plan_over_its_bounds_is_refused_scoring(work, tmp_path):
-    """At most 4 entries per input plus 10,000, each below 2^32, as the fixed rules lane bounds its plan. Entries
-    past the 64 inputs are ignored by this checker, so both proofs still verify; only scoring refuses them."""
+    """At most 4 entries per input plus 10,000, each below 2^32, as the fixed rules lane bounds its plan, and
+    (policy v12) at most a quarter of weight_bits in a prefix code, so that a plan cannot carry a copy of the
+    weights: 200 entries of 31 bits past the 64 inputs hold 12,600 bits, a copy of this network's weights about
+    1,900. Entries past the 64 inputs are ignored by this checker, so the proofs still verify; only scoring
+    refuses them, before the kernel is asked (no measured length)."""
+    heavy = PLANNED_PLAN + [2 ** 31] * 200
+    r = submit(planned_variant(tmp_path, "heavy-plan", plan=heavy), work)
+    assert r["status"] == "accepted" and r["certified_count"] == 60, r["reason"]
+    s = r["scoring"]
+    assert s["status"] == "refused" and "the plan holds 12784 bits" in s["reason"] and "1/4" in s["reason"], s
+    assert s["plan_bits"] == 12784 > s["plan_bits_budget"] and s["measured_length"] is None
     long = PLANNED_PLAN + [5] * (4 * 64 + 10_000 - 64 + 1)
     r = submit(planned_variant(tmp_path, "long-plan", plan=long), work)
     assert r["status"] == "accepted" and r["certified_count"] == 60, r["reason"]
@@ -896,6 +910,59 @@ def test_weight_bits_counts_the_sign_and_the_significant_bits_of_each_weight():
     assert accept.size_budget(8256, 198333) == 8192 + 4 * 8256  # from E = 2,048 on, v10's budget
 
 
+def test_plan_bits_is_the_length_of_a_prefix_code():
+    """plan_bits by hand (Elias gamma of each entry plus one), and its bound: a quarter of weight_bits. The honest
+    plan of the windowed proof of attn-min2 v64d8 (335 window lengths up to 182) measures 775; a copy of that
+    network's weights holds at least 31,127."""
+    sys.path.insert(0, str(HERE))
+    import accept
+    sys.path.pop(0)
+    assert [accept.plan_bits([v]) for v in (0, 1, 2, 3, 6, 7, 63, 2 ** 32 - 1)] == [1, 3, 3, 5, 5, 7, 13, 65]
+    assert accept.plan_bits([]) == 0 and accept.plan_bits([0, 1, 2, 63, 2 ** 31]) == 83
+    assert accept.plan_bits_budget(31127) == 7781
+    assert accept.plan_problem([1] * 2000, 4096, 31127) is None  # 6,000 bits
+    assert "holds 9000 bits" in accept.plan_problem([1] * 3000, 4096, 31127)
+
+
+def test_a_table_written_with_an_alphabet_of_variables_measures_a_third_of_its_bits_a_known_gap(work, tmp_path):
+    """What the description size does not bound (measured 17 November 2026). The measure counts a variable as one
+    node, whichever variable it is. A function of 256 variables, bound to 0 to 255 where it is applied, is an
+    alphabet: each use of a variable holds 8 bits and measures 1 (about 2 with the application around it). So
+    4,096 random bytes, 32,768 bits, more than a copy of attn-min2 v64d8's weights holds, measure 11,536: under
+    that network's budget (15,563, and v10's 13,376), where the same bits as numerals measure over 39,000. Charging
+    a variable, a constant or a constructor the bits that name it would close this and make honest code measure
+    three to four times as much, more than the weights of a network of that size. So there the size budget stops
+    a plain copy and no more; what holds against a copy is the pipeline's seed check (the checker locked and run on
+    a second seed, where a copy certifies nothing) with the plan's bits bounded. This test pins the gap so that a
+    change of the measure shows here."""
+    import random
+    rng = random.Random(1)
+    K, W, N = 256, 32, 4096
+    syms = [rng.randrange(K) for _ in range(N)]
+    body = "[]"
+    for i in reversed(range(0, N, W)):
+        body = "(pack " + " ".join(f"c{v}" for v in syms[i:i + W]) + " " + body + ")"
+    src = ("namespace Candidate.Alpha\n\n"
+           f"def pack ({' '.join(f'a{i}' for i in range(W))} : Nat) (r : List Nat) : List Nat :=\n"
+           f"  {' :: '.join(f'a{i}' for i in range(W))} :: r\n\n"
+           "set_option maxRecDepth 100000 in\n"
+           f"def tableF ({' '.join(f'c{i}' for i in range(K))} : Nat) : List Nat :=\n  {body}\n\n"
+           f"def table : List Nat := tableF {' '.join(str(i) for i in range(K))}\n\n"
+           "def D : Nat := table.length\n\nend Candidate.Alpha\n")
+    ws = tmp_path / "ws"
+    (ws / "Candidate").mkdir(parents=True)
+    (ws / "Candidate" / "Alpha.lean").write_text(src)
+    r = subprocess.run([sys.executable, "-B", str(HERE / "accept.py"), "compile", str(ws), "Candidate/Alpha.lean",
+                        "--repo", str(REPO), "--work", str(work), "--model", "tests/max2_tiny", "--network",
+                        "max2_tiny-v8-s0", "--claimed", "64", "--checker", "Candidate.Alpha.D"],
+                       capture_output=True, text=True, timeout=1800)
+    out = json.loads(r.stdout)
+    assert r.returncode == 0 and out["ok"] is True, out
+    p = out["scoring_preview"]
+    assert p["counted_language"] == "ok" and p["offending"] == [], p
+    assert p["description_size"] == 11536 and 8 * N == 32768, p  # 2.84 bits per unit
+
+
 def test_the_default_size_budget_is_below_a_copy_of_the_weights_on_every_zoo_setting():
     """The policy's arithmetic, with no Lean, for one network of every size setting of every model in the
     pipeline's zoo, its weights as the exporter writes them (integers over the tensor's common power-of-two
@@ -1091,7 +1158,7 @@ def test_a_checker_may_build_a_graph_of_the_linear_family_and_run_single_on_it(w
     assert r["status"] == "accepted" and r["certified_count"] == 64, r["reason"]
     s = r["scoring"]
     assert s["status"] == "scored", s
-    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v11"
+    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v12"
 
 
 def test_weight_sizes_are_read_for_free(work, tmp_path):

@@ -97,6 +97,13 @@ TRUSTED_PREFIXES = ("CompactCheck.", "Mathlib.")
 KINDS = ("performance", "auxiliary")  # a proof of Target, or a lemma: accepted with no count and no score
 COST_MODEL = "cost-v3"  # the prices (CountedCheck.lean, core/check/cost.py of the pipeline): unchanged since the open lane began
 # the open lane's policy around those prices, versioned: what a checker may use for free and the budgets.
+# v12 (17 November 2026): a plan is bounded in information too: its length in a prefix code (plan_bits) is at
+# most a quarter of weight_bits, so a plan cannot carry a copy of the weights for the checker to compute on for
+# free (the honest plan of attn-min2 v64d8's windowed proof measures 775; a copy holds at least 31,127). And a
+# proof refused scoring by a budget of the general layer (description size, kernel time) keeps what the kernel
+# verified: `measured_bill` and `measured_length`, which no frontier uses. Measured the same day: the size
+# measure does not hold a table to one unit per bit (variables are an alphabet: 32,768 random bits measure
+# 11,536), so on a network of this size the budget stops a plain copy and no more; docs/COUNTED.md.
 # v11 (16 November 2026): the description-size budget follows the network's information: 8192 + 4 E (the budget
 # up to v10), raised where it is lower to half of weight_bits (the bits a copy of the weights must hold: each
 # weight's sign and significant bits), the share raising it to at most 16,384. attn-min2 v64d8-s1: 13,376
@@ -127,7 +134,7 @@ COST_MODEL = "cost-v3"  # the prices (CountedCheck.lean, core/check/cost.py of t
 # v4 (22 October, after pilot 2 and review round 7): a free weightSize read, graph constructors of the
 # linear family and two audited match-compiler constants on the allowlist. v3 (21 October): language
 # version 4 and the description-size budget. Recorded in every receipt and in the policy digest.
-POLICY_VERSION = "open-lane-policy-v11"
+POLICY_VERSION = "open-lane-policy-v12"
 ASSURANCE = "kernel_checked_instance"  # a scored result's count and bill are both kernel-checked, never executed
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 IMPORT_LINE = re.compile(r"^\s*import\s+([A-Za-z_][A-Za-z0-9_.]*)\s*$")
@@ -162,10 +169,14 @@ KNOWLEDGE = "minimal"
 # fixed rules lane bounds its plan, the proof file's tree (core/check/checker.py: 4 nodes per input plus 10,000):
 # at most PLAN_PER_INPUT entries per input of the domain plus PLAN_BASE, each below 2^PLAN_ENTRY_BITS, so that it
 # holds indices and counts, as a plan does. Turning an entry into a number for arithmetic goes through `I.lit`,
-# charged 1, as reading a certificate number is.
+# charged 1, as reading a certificate number is. A plan's entries are plain numbers that the checker may compute
+# on for free, so the plan is bounded in information as well (policy v12): plan_bits, its length in a prefix
+# code, is at most PLAN_BITS_SHARE of weight_bits. A plan that carried a copy of the weights (checked against
+# them at about one charged operation per weight, then computed on for free) would hold at least weight_bits.
 PLAN_PER_INPUT = 4
 PLAN_BASE = 10_000
 PLAN_ENTRY_BITS = 32
+PLAN_BITS_SHARE = Fraction(os.environ.get("ACCEPT_PLAN_BITS_SHARE", "1/4"))  # of weight_bits
 SIZE_BUDGET_BASE = int(os.environ.get("ACCEPT_SIZE_BUDGET_BASE", 8192))
 SIZE_BUDGET_PER_PARAM = int(os.environ.get("ACCEPT_SIZE_BUDGET_PER_PARAM", 4))
 SIZE_BUDGET_SHARE = Fraction(os.environ.get("ACCEPT_SIZE_BUDGET_SHARE", "1/2"))  # of weight_bits
@@ -192,14 +203,30 @@ def size_budget(extract: int, bits: int) -> int:
                min(math.floor(SIZE_BUDGET_SHARE * bits), SIZE_BUDGET_SHARE_CAP))
 
 
-def plan_problem(plan: list, domain: int) -> str | None:
-    """Why a plan is over its bounds, or None."""
+def plan_bits(plan: list) -> int:
+    """The length of a plan in a prefix code (Elias gamma of each entry plus one: 2 * bitlength - 1 bits, so 0
+    costs 1, 1 and 2 cost 3, 63 costs 13). The entries can be read back from the code, so a plan that holds b
+    bits of information measures at least b."""
+    return sum(2 * (v + 1).bit_length() - 1 for v in plan)
+
+
+def plan_bits_budget(bits: int) -> int:
+    """The most a plan may measure on a network with `bits` = weight_bits."""
+    return math.floor(PLAN_BITS_SHARE * bits)
+
+
+def plan_problem(plan: list, domain: int, bits: int) -> str | None:
+    """Why a plan is over its bounds on a network with `bits` = weight_bits, or None."""
     cap = PLAN_PER_INPUT * domain + PLAN_BASE
     if len(plan) > cap:
         return f"the plan has {len(plan)} entries, more than {cap} ({PLAN_PER_INPUT} per input plus {PLAN_BASE})"
     big = next((i for i, v in enumerate(plan) if v >= 1 << PLAN_ENTRY_BITS), None)
     if big is not None:
         return f"plan entry {big} is {plan[big]}, not below 2^{PLAN_ENTRY_BITS}"
+    held, most = plan_bits(plan), plan_bits_budget(bits)
+    if held > most:
+        return (f"the plan holds {held} bits (its length in a prefix code), more than {most}: "
+                f"{PLAN_BITS_SHARE} of the {bits} bits a copy of the weights holds at least")
     return None
 
 
@@ -752,6 +779,8 @@ def score_before_kernel(scored: dict, prot: dict, net_json: Path, trusted: list[
     out = {"status": None, "reason": None, "assurance": ASSURANCE, "cost_model": COST_MODEL,
            "bill": None, "extract": extract, "read": read, "length": None,
            "plan_entries": None if plan is None else len(plan),
+           "plan_bits": None if plan is None else plan_bits(plan), "plan_bits_budget": plan_bits_budget(bits),
+           "measured_bill": None, "measured_length": None,
            "description_size": None, "weight_bits": bits,
            "size_budget": None if extract is None else size_budget(extract, bits),
            "general_kernel_ms": None, "general_kernel_budget_ms": GENERAL_KERNEL_BUDGET_MS, "rest_kernel_ms": None,
@@ -762,7 +791,7 @@ def score_before_kernel(scored: dict, prot: dict, net_json: Path, trusted: list[
                    "something; cost-v3 charges them to extract once, which the open lane does not compute yet")
         return out
     if plan is not None:
-        why = plan_problem(plan, prot["domain"])
+        why = plan_problem(plan, prot["domain"], bits)
         if why:
             out.update(status="refused", reason=why)
             return out
@@ -803,6 +832,9 @@ def score_after_kernel(scored: dict, out: dict, last: dict | None) -> dict:
     out.update(description_size=general.get("description_size"), general_kernel_ms=general.get("kernel_ms"),
                rest_kernel_ms=rest.get("kernel_ms"), general_constants=general.get("constants"),
                checker_constants=general.get("checker_constants"))
+    # what the kernel verified, whatever the budgets below decide: the bill the instance proves and the length it
+    # gives. A proof refused scoring keeps them (no frontier uses them), so its measurement is not lost.
+    out.update(measured_bill=scored["claimed_bill"], measured_length=scored["claimed_bill"] + out["extract"] + out["read"])
     if out["description_size"] is None or out["description_size"] > out["size_budget"]:
         out.update(status="refused", reason=f"the checker's description size {out['description_size']} exceeds the budget {out['size_budget']}")
         return out
@@ -850,7 +882,7 @@ def policy_digest() -> str:
     h.update(json.dumps({"policy_version": POLICY_VERSION, "knowledge": KNOWLEDGE,
                          "size_budget": [SIZE_BUDGET_BASE, SIZE_BUDGET_PER_PARAM, str(SIZE_BUDGET_SHARE),
                                          SIZE_BUDGET_SHARE_CAP],
-                         "plan_bounds": [PLAN_PER_INPUT, PLAN_BASE, PLAN_ENTRY_BITS],
+                         "plan_bounds": [PLAN_PER_INPUT, PLAN_BASE, PLAN_ENTRY_BITS, str(PLAN_BITS_SHARE)],
                          "general_kernel_budget_ms": GENERAL_KERNEL_BUDGET_MS,
                          "allowed_axioms": sorted(ALLOWED_AXIOMS), "trusted_prefixes": TRUSTED_PREFIXES}).encode())
     return h.hexdigest()[:16]
@@ -894,11 +926,11 @@ def candidate_imports(ws: Path, module: str) -> tuple[list[str], list[str]]:
 
 
 def scoring_preview(ws: Path, module: str, checker: str, prot: dict, net_json: Path, lean: Path, lp: list[str],
-                    mode: str) -> dict:
-    """The two scoring checks that need no kernel work, run on a development compile as the score step runs them:
-    the counted-language closure of `checker` against the allowlist in force, and its description size against
-    the budget. A preview, not a verdict: the submission's score step also has the kernel check the soundness and
-    instance theorems and times the general layer."""
+                    mode: str, plan: list | None = None) -> dict:
+    """The scoring checks that need no kernel work, run on a development compile as the score step runs them:
+    the counted-language closure of `checker` against the allowlist in force, its description size against
+    the budget and, with a plan, the plan's bits against theirs. A preview, not a verdict: the submission's score
+    step also has the kernel check the soundness and instance theorems and times the general layer."""
     ps = checker.split(".")
     if len(ps) < 2 or ps[0] != "Candidate" or not all(IDENT.match(x) for x in ps):
         return {"error": "the checker must be a constant of the candidate, such as Candidate.MyChecker.D"}
@@ -926,6 +958,9 @@ def scoring_preview(ws: Path, module: str, checker: str, prot: dict, net_json: P
            "description_size": size, "size_budget": budget,
            "within_budget": None if size is None or budget is None else size <= budget,
            "largest_definitions": [{"name": k, "size": v} for k, v in by[:8]]}
+    if plan is not None:
+        most = plan_bits_budget(weight_bits(net))
+        out.update(plan_bits=plan_bits(plan), plan_bits_budget=most, plan_within_budget=plan_bits(plan) <= most)
     if last.get("reason"):
         out["reason"] = last["reason"]
     return out
@@ -962,7 +997,7 @@ def compile_for_development(ws: Path, rel: str, repo: Path, model: str, network:
            "protected_module": prot["module"], "messages": text, "seconds": round(res["seconds"], 1)}
     if checker and ok:
         try:
-            out["scoring_preview"] = scoring_preview(ws, module, checker, prot, net_json, lean, lp, mode)
+            out["scoring_preview"] = scoring_preview(ws, module, checker, prot, net_json, lean, lp, mode, plan)
         except (Reject, Unsupported, Infra) as exc:
             out["scoring_preview"] = {"error": str(exc)}
     return out

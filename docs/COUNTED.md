@@ -1,4 +1,4 @@
-# The counted language (step 2 of the open lane; version 4 of the language, policy v11, 16 November)
+# The counted language (step 2 of the open lane; version 4 of the language, policy v12, 17 November)
 
 How a scored open-lane proof gets a length: its checker `D` is written against an abstract interpreter
 whose operations are the only way to touch a number of the network, the service runs it with the
@@ -391,6 +391,11 @@ manifest), `score_eligible` says whether it was scored, and the `scoring` block 
 
     length = claimed_bill + extract + read,  extract = number of weight entries,  read = certificate size
 
+A proof that the kernel verified and a budget of the general layer then refused (description size, kernel
+time) has no `bill` and no `length`, and keeps `measured_bill` and `measured_length` (policy v12): what the
+instance proves and the length it gives. No frontier or score uses them; they are there so that a refused
+proof's measurement is not lost. A scored proof has the same numbers in both pairs.
+
 The mapping to `cost-v3`'s categories: `single`, `interval`, `gsingle` (billed as `single`), `ginterval`
 (billed as `interval`) and `gtokenIntervals` (billed as `token_interval` and `tables`) through the counted
 operations, `extract`
@@ -416,13 +421,24 @@ carry it (`I.cert` returns an abstract number, not an index). A planned checker 
 - not trusted: the soundness theorem holds for every plan, and the general layer may not mention the protected
   module's `plan` (only `graph` and `task`), so only the instance runs the checker on it;
 - bounded as the fixed rules lane bounds its tree: at most 4 entries per input plus 10,000, each below 2^32
-  (`plan_problem` in `accept.py`; the bounds are in the policy digest).
+  (`plan_problem` in `accept.py`; the bounds are in the policy digest);
+- bounded in information (policy v12, 17 November): `plan_bits`, the plan's length in a prefix code (Elias
+  gamma of each entry plus one: 0 costs 1 bit, 1 and 2 cost 3, 63 costs 13), is at most a quarter of
+  `weight_bits` (below).
 
-Nothing can hide in it for the same reason as in that lane: the plan only says which checks run where, every
-check's work on numbers is charged where it runs, and a soundness proof cannot rely on what the plan says.
+A plan says which checks run where, every check's work on the network's numbers is charged where it runs, and a
+soundness proof cannot rely on what the plan says. But a plan's entries are plain numbers, and a checker may
+compute on them for free. A plan that held a copy of the weights, which the checker compared with the weights
+at about one charged operation each, would let the forward pass itself run on the copy uncharged, with a
+soundness proof that holds for every plan (a plan that is not a copy certifies nothing). The entry bounds do
+not exclude that: 4 entries per input of 32 bits are far more than the weights. The information bound does: a
+copy holds at least `weight_bits`, and a plan a quarter of that at most. Honest plans are far below it: the
+plan of attn-min2 v64d8's windowed proof (335 window lengths) measures 775 bits against a bound of 7,781.
+The receipt and the development preview give `plan_bits` and `plan_bits_budget`.
+
 `examples/open_lane/max2_tiny_planned` chooses 60 of the 64 inputs by a plan of 64 flags (bill 3,780, length
-3,860); the tests show that a soundness theorem for one plan only, or one that names the protected plan, is
-refused scoring, as is a plan over its bounds. Unplanned submissions are checked exactly as before.
+3,860; 184 bits); the tests show that a soundness theorem for one plan only, or one that names the protected
+plan, is refused scoring, as is a plan over its bounds. Unplanned submissions are checked exactly as before.
 
 ## General-layer safeguards
 
@@ -487,6 +503,31 @@ with `W` = `weight_bits` and `E` the parameter count (the `#const` weights are i
 than the budget, at least twice where the share decides; no budget below v10's) and refuses on max2 v64 a
 checker whose code holds only the significant bits of the weights (no signs, no exponents) under the default
 policy. Receipts carry `weight_bits` beside `size_budget`.
+
+### What the size budget does not bound (measured 17 November)
+
+The rates above were meant to make a table of `b` bits measure at least `b`. They do not. The measure counts a
+variable, a constant or a constructor as one node, whichever it is, so a large set of them is an alphabet. A
+function of 256 variables, bound to 0 to 255 where it is applied, holds 8 bits in each use of a variable, which
+measures 1 (about 2 with the application around it):
+
+| 32,768 random bits written as | description size |
+| --- | --- |
+| numerals of 32 bits | 39,239 |
+| 4,096 uses of 256 variables, 32 to an application | 11,536 |
+
+That is 2.84 bits per unit, and under the budget of attn-min2 v64d8 (15,563 in v11, 13,376 in v10), whose
+weights hold 31,127 bits. A candidate's own constants or the constructors of its own type do the same.
+Charging every such node the bits that name it would close this, and would make honest code measure three to
+four times as much: more than the weights of a network of that size. So on such a network no size budget both
+lets an honest checker through and keeps a copy out, whatever the measure. The budget stops a plain copy
+(numerals, strings, booleans, Church encodings), and that is all it is relied on for.
+
+What holds against a copy is not a size. The pipeline's seed check locks the checker and runs it, unchanged,
+on a second network: a copy in the code certifies nothing there, since the code was fixed before that
+network was shown, and everything the agent writes for the second network is the instance, of which the
+plan (bounded in information, above) is the only free data. `scripts/test_accept.py` pins the measurement
+(`..._a_known_gap`), so that a change of the measure shows.
 
 ## Reproduction (`CountedCheck.lean`, `compactcheck cost`)
 
