@@ -1,9 +1,10 @@
-# The counted language (step 2 of the open lane; version 4 of the language, policy v14, 17 November)
+# The counted language (step 2 of the open lane; version 4 of the language, policy v15, 18 November)
 
 How a scored open-lane proof gets a length: its checker `D` is written against an abstract interpreter
 whose operations are the only way to touch a number of the network, the service runs it with the
 interpreter that charges `cost-v3`'s prices, a mechanical check of `D`'s definition makes sure it reaches
-no other interpreter, and the kernel evaluates the result on the protected weights.
+no other interpreter, and the kernel evaluates the result on the protected weights (or, since policy v15
+and when the proof asks for it, the compiled checker does: "The run by compiled code" below).
 
 ## The problem
 
@@ -730,6 +731,72 @@ move every nonzero parameter on its own, so they break that structure and such a
 Zeros stay zeros, the exporter's constants stay, and a tensor used twice in the graph is one tensor, so the
 common cases hold; trained weights have no other exact structure. It is a limit to state for a network
 built by hand.
+
+### The run by compiled code (policy v15, 18 November)
+
+A scored result is two statements, put together:
+
+    (1)  for every w:   D(w) ≤ correct(w)        soundness
+    (2)  D(W) = n, at a bill of L                 the run on this network
+    ---------------------------------------------------------------
+         n ≤ correct(W), at length L + E + the certificate's numbers
+
+(1) is mathematics: a theorem for every weight, which the kernel checks. (2) is arithmetic: run this program
+on these numbers. Until this policy the kernel did both, (2) as the instance theorem. The kernel is a proof
+checker, not a calculator: it follows definitions step by step and holds what it has computed until the
+theorem is done. So (2) was where a check's time and memory went, and most of a proof's modules existed
+only to cut the run into pieces the kernel can hold.
+
+A proof may now leave (2) to the service: `"run": "compiled"` in the manifest's scored block. It then names
+a checker and a soundness theorem and nothing else: no instance theorem, no claimed bill, no claimed count
+(`claimed_count`, if given, only names the claim's protected module for modules written against it, as it
+does for a lemma). The service
+
+1. has the kernel replay every constant of the candidate and accept the soundness statement of the checker
+   (`acceptcheck sound`, the general layer timed as before);
+2. runs the compiled checker on the network with the proof's certificate and plan (`acceptcheck probe`):
+   the count and the bill are what `CostM.billed (D Interp.counting) ⟨weights, cert⟩` evaluates to, which
+   with (1) and `CostM.exec_of_billed` is the result above;
+3. applies every scoring condition as before: the counted language, the size and plan budgets, the general
+   layer's kernel time, and the last-bits test, whose copies are run in the same process as (2).
+
+Measured on the cloud machine (2 cores, 6 GB for a process), the same checkers both ways:
+
+| proof | by the kernel | by the compiled run |
+| --- | --- | --- |
+| brute force, tiny linear network (64 inputs) | 64 at 4,112, 29 s | 64 at 4,112, 14 s |
+| brute force, tiny attention network (64 inputs) | 64 at 12,360; its 64 kernel facts compile in two minutes at 2.5 GB | 64 at 12,360, 16 s |
+| run attn-min2-ptl-3, round 2 (attention, 4,096 inputs) | 1,889 at 192,059: 26 modules, check 515 s | 1,889 at 192,059: the 12 modules of checker and soundness, 78 s |
+| pilot-linear-max2-test-2 (linear, 4,096 inputs) | 4,095 at 298,016: 10 modules; 82 minutes on the Mac on 11 November, out of memory here | 4,095 at 298,016: 1 module, 21 s |
+
+The counts and the bills are equal in every case where both exist: the compiled run reproduces what the
+kernel established.
+
+What is trusted beyond the kernel, for (2) alone: that Lean's compiler and runtime evaluate the checker as
+its definition says. The receipt says which it was (`run`: kernel or compiled; `execution_assurance`:
+`kernel_checked_instance` or `compiled_instance`), and a result of one kind is never shown as the other.
+What keeps the compiled run the checker's run: its type is checked by the kernel before it is run; a
+candidate module that gives a definition other compiled code than its body (`implemented_by`, `extern`,
+`export`, `csimp`) or runs code when loaded is refused; so is a checker without compiled code
+(`noncomputable`), or one whose run does not come to an end. With the run left to the service these are
+rejections, since without a run there is no count. The run is made in the box.
+
+The kernel's way is unchanged and is the default (`"run": "kernel"`). A result that matters can be
+established both ways: the compiled run during the work, the kernel's instance once at the end.
+
+The development compile shows the run before a submission: `accept.py compile --checker` reports `run`
+(count, bill, and the length they make with the certificate given), which with `"run": "compiled"` is what
+a submission of that checker is scored with.
+
+The probe prints what each run gave as it finishes (`{"status":"run","done":k,"count":n,"bill":b}`), so the
+run on the network is known when a later one is stopped. A preview whose two minutes run out on a copy
+still shows `run`. A submission whose run on a copy does not come to an end (a crash, the hour) keeps the
+count of its run on the network: accepted with that count and refused scoring, the last-bits test not
+having been passed. Only a checker with no run on the network is rejected.
+
+Examples: `examples/open_lane/max2_tiny_run` and `attn_max2_tiny_run` (the checker and soundness theorem of
+the scored brute-force examples, one module each). Tests: `scripts/test_accept.py`, "the run by compiled
+code".
 
 ## Reproduction (`CountedCheck.lean`, `compactcheck cost`)
 

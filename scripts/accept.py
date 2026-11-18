@@ -167,8 +167,21 @@ COST_MODEL = "cost-v3"  # the prices (CountedCheck.lean, core/check/cost.py of t
 # that gives a definition other compiled code (implemented_by, extern, export, csimp) or runs code when loaded,
 # a noncomputable checker, a run that does not come to an end. The development compile's preview makes the
 # same runs (scoring_preview), so that the test's answer costs a compile to see and not a submission.
-POLICY_VERSION = "open-lane-policy-v14"
+# v15 (18 November 2026): the checker's run on the network may be the compiled checker's (scored.run:
+# "compiled"). A scored result is two statements: the checker never counts more than the network gets right,
+# for every weight (soundness: mathematics), and on this network it counts n at a bill of L (the run:
+# arithmetic). Until now the kernel made the run too, as the instance theorem; that is where the time and
+# the memory went (the run of attn-min2-ptl-3's proof: about 400 s in the kernel, about 1 s compiled), and most
+# of a proof's modules existed to cut the run into pieces the kernel can hold. With run "compiled" the
+# candidate proves soundness alone, the kernel checks it (acceptcheck sound), and the service runs the compiled
+# checker for the count and the bill (acceptcheck probe, the run the last-bits test already makes). What is
+# trusted beyond the kernel is then Lean's compiler and runtime, for this one evaluation; the receipt says
+# which it was (run, execution_assurance). Everything else is as before: the counted language, the budgets,
+# the last-bits test on the same runs. Run "kernel", the default, is unchanged.
+POLICY_VERSION = "open-lane-policy-v15"
 ASSURANCE = "kernel_checked_instance"  # a scored result's count and bill are both kernel-checked, never executed
+ASSURANCE_RUN = "compiled_instance"  # soundness is kernel-checked; the count and the bill are the compiled checker's run
+RUNS = ("kernel", "compiled")  # scored.run: who runs the checker on the network
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 IMPORT_LINE = re.compile(r"^\s*import\s+([A-Za-z_][A-Za-z0-9_.]*)\s*$")
 COMPILE_TIMEOUT_S = 3600
@@ -578,6 +591,24 @@ def read_manifest(cdir: Path) -> dict:
         raise Reject(f"manifest.json is not JSON: {exc}")
     if not isinstance(m, dict) or m.get("schema") != SCHEMA:
         raise Reject(f"manifest schema must be {SCHEMA}")
+    run = None
+    if isinstance(m.get("scored"), dict):
+        run = m["scored"].setdefault("run", "kernel")
+        if run not in RUNS:
+            raise Reject(f"scored.run must be one of {RUNS}")
+    if run == "compiled":
+        # the candidate proves soundness and claims no count: the service runs the checker (policy v15). The
+        # theorem the kernel is asked for is the soundness theorem.
+        if not isinstance(m["scored"].get("sound"), str):
+            raise Reject("scored.sound must be a constant name")
+        if m.get("theorem", m["scored"]["sound"]) != m["scored"]["sound"]:
+            raise Reject("with scored.run compiled the theorem is scored.sound, or is left out")
+        for key in ("instance", "claimed_bill"):
+            if key in m["scored"]:
+                raise Reject(f"with scored.run compiled there is no scored.{key}: the service runs the checker itself")
+        # claimed_count then claims nothing: as for a lemma, it names the claim's protected module, which modules
+        # written for a kernel instance import (0 when left out; a module can import the network's own instead)
+        m.update(theorem=m["scored"]["sound"], claimed_count=m.get("claimed_count", 0))
     for key, typ in (("candidate_id", str), ("model", str), ("network", str), ("theorem", str), ("modules", list)):
         if not isinstance(m.get(key), typ):
             raise Reject(f"manifest field {key} must be a {typ.__name__}")
@@ -615,7 +646,9 @@ def read_manifest(cdir: Path) -> dict:
         s = m["scored"]
         if not isinstance(s, dict):
             raise Reject("scored must be an object")
-        for key in ("checker", "sound", "instance"):
+        if m["kind"] != "performance":
+            raise Reject("only a performance submission can be scored")
+        for key in ("checker", "sound") + (("instance",) if s["run"] == "kernel" else ()):
             v = s.get(key)
             if not isinstance(v, str):
                 raise Reject(f"scored.{key} must be a constant name")
@@ -623,7 +656,7 @@ def read_manifest(cdir: Path) -> dict:
             if len(ps) < 2 or ps[0] != "Candidate" or not all(IDENT.match(x) for x in ps):
                 raise Reject(f"scored.{key} must be a name under Candidate., made of identifiers")
         b = s.get("claimed_bill")
-        if not isinstance(b, int) or isinstance(b, bool) or b < 0:
+        if s["run"] == "kernel" and (not isinstance(b, int) or isinstance(b, bool) or b < 0):
             raise Reject("scored.claimed_bill must be a natural number")
         sys.path.insert(0, str(HERE))
         try:
@@ -739,15 +772,17 @@ def submit(cdir: Path, repo: Path, work: Path, want_mode: str) -> dict:
     receipt = {"schema": RECEIPT_SCHEMA, "candidate_id": None, "status": None, "reason": None,
                "claim_kind": None, "certified_count": None, "domain_size": None, "claimed_count": None, "network": None,
                "theorem": None, "statement": None, "axioms": None, "isolation": None, "steps": [], "digests": {},
-               "score_eligible": False, "execution_assurance": None, "cost_model": COST_MODEL, "policy_version": POLICY_VERSION,
-               "knowledge": KNOWLEDGE,
+               "score_eligible": False, "execution_assurance": None, "run": None, "cost_model": COST_MODEL,
+               "policy_version": POLICY_VERSION, "knowledge": KNOWLEDGE,
                "scoring": {"status": "not_requested"},
                "seconds": None, "time": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
     ws = None
     try:
         manifest = read_manifest(cdir)
-        receipt.update(candidate_id=manifest["candidate_id"], claimed_count=manifest["claimed_count"] if manifest["kind"] == "performance" else None,
-                       network=manifest["network"], theorem=manifest["theorem"], claim_kind=manifest["kind"])
+        run = (manifest.get("scored") or {}).get("run")  # "kernel", "compiled", or None for a proof that is not scored
+        receipt.update(candidate_id=manifest["candidate_id"], network=manifest["network"], theorem=manifest["theorem"],
+                       claim_kind=manifest["kind"], run=run,
+                       claimed_count=manifest["claimed_count"] if manifest["kind"] == "performance" and run != "compiled" else None)
         mode = box_mode(want_mode)
         receipt["isolation"] = mode if mode in ("landlock", "seatbelt") else "process (weak: no Landlock here)"
         lean = lean_binary()
@@ -803,6 +838,11 @@ def submit(cdir: Path, repo: Path, work: Path, want_mode: str) -> dict:
         scoring = None  # a scored proof: what scoring finds before the kernel (score_before_kernel)
         if manifest["kind"] == "auxiliary":
             cmd = [str(acceptcheck_binary()), "lemma", manifest["theorem"]] + trusted + ["--"] + oleans
+        elif run == "compiled":
+            # soundness alone goes to the kernel; the run on the network is made below, compiled
+            scoring = score_before_kernel(scored, prot, net_json, trusted, oleans, ws, env, mode, lean, lp_all, receipt)
+            cmd = [str(acceptcheck_binary()), "sound" if scored.get("plan") is None else "sound-planned", prot["module"],
+                   scored["checker"], scored["sound"]] + trusted + ["--"] + oleans
         else:
             if scored:
                 scoring = score_before_kernel(scored, prot, net_json, trusted, oleans, ws, env, mode, lean, lp_all, receipt)
@@ -814,7 +854,7 @@ def submit(cdir: Path, repo: Path, work: Path, want_mode: str) -> dict:
                 cmd = [str(acceptcheck_binary()), "check", prot["module"] + ".Target", manifest["theorem"]] + trusted + ["--"] + oleans
         chk = run_boxed(ws, cmd, env, mode, CHECK_TIMEOUT_S, [str(toolchain_root(lean)), str(LEAN_PROJECT)] + lp_all)
         receipt["steps"].append({"step": "kernel", "rc": chk["rc"], "seconds": chk["seconds"], "timed_out": chk["timed_out"],
-                                 "scores": cmd[1].startswith("check-score")})
+                                 "scores": cmd[1].startswith(("check-score", "sound"))})
         if chk["timed_out"]:
             receipt.update(status="timeout", reason=f"the kernel check exceeded {CHECK_TIMEOUT_S} s")
             return finish(receipt, work, t0)
@@ -830,6 +870,32 @@ def submit(cdir: Path, repo: Path, work: Path, want_mode: str) -> dict:
             raise Reject(f"the proof depends on axioms that are not allowed: {', '.join(bad)}")
         if manifest["kind"] == "auxiliary":
             receipt.update(status="accepted", statement=last.get("statement"), replayed_constants=last.get("replayed"))
+            return finish(receipt, work, t0)
+        if run == "compiled":
+            # the run: the compiled checker on the network, and on the last-bits copies in the same process
+            res = last_bits_runs(scored["checker"], scored.get("plan") is not None, prot, net_json, list(zip(order, oleans)),
+                                 ws, env, mode, lean, lp_all, work)
+            receipt["steps"].append({"step": "run", "rc": res["rc"], "seconds": res["seconds"],
+                                     "timed_out": res["timed_out"], "status": res["status"]})
+            if res["status"] == "error":
+                raise Infra(f"acceptcheck probe failed: {res['reason']}")
+            base = res.get("base") or {}  # the run on the network: known also when a later run, on a copy, was stopped
+            why = run_problem(res, "The service")
+            if why is None and base.get("count") is None:
+                why = "the checker returns nothing on the network (its run fails), so it certifies no count"
+            if why and base.get("count") is None:
+                raise Reject(why)  # soundness is proved and nothing was run: there is no count to accept
+            count, bill = base["count"], base["bill"]  # with `why`: a count, and no score (last_bits_verdict says why)
+            receipt.update(status="accepted", certified_count=count, replayed_constants=last.get("replayed"))
+            ran = {**scored, "claimed_bill": bill}
+            out = score_after_kernel(ran, scoring, last) if scoring["status"] is None else dict(scoring)
+            if out.get("measured_bill") is None and out.get("extract") is not None:  # refused before the kernel
+                out.update(measured_bill=bill, measured_length=bill + out["extract"] + out["read"])
+            if out["status"] == "scored":
+                out = last_bits_verdict(ran, out, count, res)
+            receipt["scoring"] = out
+            if out["status"] == "scored":
+                receipt.update(score_eligible=True, execution_assurance=ASSURANCE_RUN)
             return finish(receipt, work, t0)
         receipt.update(status="accepted", certified_count=manifest["claimed_count"],
                        replayed_constants=last.get("replayed"))
@@ -860,7 +926,8 @@ def score_before_kernel(scored: dict, prot: dict, net_json: Path, trusted: list[
     bits = weight_bits(net)
     read = len(scored["certificate"])
     plan = scored.get("plan")
-    out = {"status": None, "reason": None, "assurance": ASSURANCE, "cost_model": COST_MODEL,
+    out = {"status": None, "reason": None, "cost_model": COST_MODEL, "run": scored.get("run", "kernel"),
+           "assurance": ASSURANCE_RUN if scored.get("run") == "compiled" else ASSURANCE,
            "bill": None, "extract": extract, "read": read, "length": None,
            "plan_entries": None if plan is None else len(plan),
            "plan_bits": None if plan is None else plan_bits(plan), "plan_bits_budget": plan_bits_budget(bits),
@@ -972,7 +1039,7 @@ def last_bits_runs(checker: str, planned: bool, prot: dict, net_json: Path, modu
       uncompiled  "reason": the checker has no compiled code (noncomputable)
       untyped     "reason": the name is not a checker's (its type is not Checker, or List Nat → Checker with a plan)
       stopped     "reason", "done": the checker's own code did not run to the end (a crash, memory, timeout_s),
-                  after `done` of the runs
+                  after `done` of the runs; with "base" when the run on the network was among them
       error       "reason": the probe itself could not be run; the service's fault, not the candidate's."""
     files = last_bits_files(net_json, work)
     cmd = [str(acceptcheck_binary()), "probe-planned" if planned else "probe", prot["module"], checker, str(net_json)] + \
@@ -997,7 +1064,11 @@ def last_bits_runs(checker: str, planned: bool, prot: dict, net_json: Path, modu
                 "counts": [(k, int(r.get("count") or 0)) for (k, _), r in zip(files, runs[1:])]}
     if any(d.get("status") == "loaded" for d in lines) and last.get("status") in ("loaded", "run"):
         # everything of the service's was done; the process ended in the candidate's code
-        done = max([int(d.get("done") or 0) for d in lines if d.get("status") == "run"], default=0)
+        ran = [d for d in lines if d.get("status") == "run"]
+        done = max([int(d.get("done") or 0) for d in ran], default=0)
+        first = [d for d in ran if d.get("done") == 1 and "count" in d]  # the run on the network, when it was made
+        if first:
+            out["base"] = {"count": first[0].get("count"), "bill": first[0].get("bill")}
         where = "on the network" if done == 0 else f"on copy {done} of {len(files)}"
         if chk["timed_out"]:
             why = f"did not finish within {timeout_s:.0f} s"
@@ -1036,30 +1107,34 @@ def last_bits_block(count: int, counts: list[tuple[int, int]]) -> tuple[dict, in
 
 
 REPLACED = ("the module {module} uses `{by}`: it gives a definition other compiled code than its body, or runs code when "
-            "it is loaded. The last-bits test runs the checker compiled, and takes it for the checker the kernel ran only "
-            "where the two are the same code")
-UNCOMPILED = ("the checker has no compiled code to run ({reason}). The last-bits test runs the checker compiled: neither "
-              "the checker nor anything it uses may be `noncomputable`")
-STOPPED = ("the compiled checker did not run to the end: {reason}. The last-bits test runs the checker compiled, on the "
-           "network and on copies of it, each in one run from start to end")
+            "it is loaded. {who} runs the checker compiled, and takes it for the checker the kernel knows only where the "
+            "two are the same code")
+UNCOMPILED = ("the checker has no compiled code to run ({reason}). {who} runs the checker compiled: neither the checker "
+              "nor anything it uses may be `noncomputable`")
+STOPPED = ("the compiled checker did not run to the end: {reason}. {who} runs the checker compiled, on the network and on "
+           "copies of it, each in one run from start to end")
 
 
-def last_bits(scored: dict, out: dict, count: int, prot: dict, net_json: Path, modules: list[tuple[str, str]], ws: Path,
-              env: dict, mode: str, lean: Path, lp_all: list[str], work: Path, receipt: dict) -> dict:
-    """The last-bits test of a proof the kernel has scored (header, policy v14): the checker, compiled, with the
-    proof's certificate and plan, on the network and on copies of it whose weights differ in their last bits.
-    Returns the scoring block with `last_bits` added: the count on every copy, the least share of the network's
-    count at the deciding levels, and whether that is enough. Refuses scoring, with the measured bill and length
-    kept, when it is not, when the compiled checker does not give on the network what the kernel established,
-    when a module of the candidate replaces compiled code or runs code when loaded (then the compiled checker
-    need not be the checker), when the checker has no compiled code, or when its own code does not run to the
-    end. A probe that could not be run for another reason is the service's fault and raises Infra, with the
-    receipt's scoring left unsettled (status None)."""
+def run_problem(res: dict, who: str) -> str | None:
+    """Why the compiled checker gave no runs to go by, in the candidate's terms; None when it ran (status ok).
+    `who` runs it: "The last-bits test", or "The service" when the run is the result (scored.run compiled)."""
+    if res["status"] == "replaced":
+        return REPLACED.format(module=res["module"], by=res["by"], who=who)
+    if res["status"] == "uncompiled":
+        return UNCOMPILED.format(reason=res["reason"], who=who)
+    if res["status"] == "untyped":
+        return f"{who} cannot run the checker: {res['reason']}"
+    if res["status"] == "stopped":
+        return STOPPED.format(reason=res["reason"], who=who)
+    return None
+
+
+def last_bits_verdict(scored: dict, out: dict, count: int, res: dict) -> dict:
+    """The last-bits test's answer to the runs of a scored proof's compiled checker (`res`, of last_bits_runs,
+    status not error): the scoring block with `last_bits`, refused when the checker could not be run as the
+    kernel knows it, when its run on the network is not the count and bill it is scored with, or when a
+    deciding copy keeps less than LAST_BITS_KEEP of the count. The measured bill and length are kept."""
     out = dict(out)
-    res = last_bits_runs(scored["checker"], scored.get("plan") is not None, prot, net_json, modules, ws, env, mode,
-                         lean, lp_all, work)
-    receipt["steps"].append({"step": "last_bits", "rc": res["rc"], "seconds": res["seconds"],
-                             "timed_out": res["timed_out"], "status": res["status"]})
     block = {"levels": list(LAST_BITS_LEVELS), "recorded": list(LAST_BITS_RECORDED), "copies": LAST_BITS_COPIES,
              "keep": str(LAST_BITS_KEEP), "runs": None, "least_share": None, "holds_to": None, "passed": False}
     out["last_bits"] = block
@@ -1068,19 +1143,9 @@ def last_bits(scored: dict, out: dict, count: int, prot: dict, net_json: Path, m
         out.update(status="refused", reason=reason, bill=None, length=None)
         return out
 
-    if res["status"] == "error":
-        # the proof is verified and its scoring is not settled: the receipt must not read as scored
-        receipt["scoring"] = {**out, "status": None, "reason": "the last-bits test could not be run", "bill": None,
-                              "length": None, "last_bits": {**block, "passed": None}}
-        raise Infra(f"acceptcheck probe failed: {res['reason']}")
-    if res["status"] == "replaced":
-        return refuse(REPLACED.format(module=res["module"], by=res["by"]))
-    if res["status"] == "uncompiled":
-        return refuse(UNCOMPILED.format(reason=res["reason"]))
-    if res["status"] == "untyped":
-        return refuse(f"the last-bits test cannot run {scored['checker']}: {res['reason']}")
-    if res["status"] == "stopped":
-        return refuse(STOPPED.format(reason=res["reason"]))
+    why = run_problem(res, "The last-bits test")
+    if why:
+        return refuse(why)
     base = res["base"]
     if base.get("count") != count or base.get("bill") != scored["claimed_bill"]:
         return refuse(f"the compiled checker gives count {base.get('count')} and bill {base.get('bill')} on the network, "
@@ -1096,6 +1161,28 @@ def last_bits(scored: dict, out: dict, count: int, prot: dict, net_json: Path, m
                       "that belong to this network reach a checker through the certificate, and a check on them needs room "
                       "for the weights' last bits")
     return out
+
+
+def last_bits(scored: dict, out: dict, count: int, prot: dict, net_json: Path, modules: list[tuple[str, str]], ws: Path,
+              env: dict, mode: str, lean: Path, lp_all: list[str], work: Path, receipt: dict) -> dict:
+    """The last-bits test of a proof the kernel has scored (header, policy v14): the checker, compiled, with the
+    proof's certificate and plan, on the network and on copies of it whose weights differ in their last bits.
+    Returns the scoring block with `last_bits` added (last_bits_verdict). A probe that could not be run for a
+    reason that is not the candidate's is the service's fault and raises Infra, with the receipt's scoring left
+    unsettled (status None)."""
+    res = last_bits_runs(scored["checker"], scored.get("plan") is not None, prot, net_json, modules, ws, env, mode,
+                         lean, lp_all, work)
+    receipt["steps"].append({"step": "last_bits", "rc": res["rc"], "seconds": res["seconds"],
+                             "timed_out": res["timed_out"], "status": res["status"]})
+    if res["status"] == "error":
+        # the proof is verified and its scoring is not settled: the receipt must not read as scored
+        receipt["scoring"] = {**out, "status": None, "reason": "the last-bits test could not be run", "bill": None,
+                              "length": None,
+                              "last_bits": {"levels": list(LAST_BITS_LEVELS), "recorded": list(LAST_BITS_RECORDED),
+                                            "copies": LAST_BITS_COPIES, "keep": str(LAST_BITS_KEEP), "runs": None,
+                                            "least_share": None, "holds_to": None, "passed": None}}
+        raise Infra(f"acceptcheck probe failed: {res['reason']}")
+    return last_bits_verdict(scored, out, count, res)
 
 
 FREE_OPS = ("input", "param", "index", "transpose", "unsqueeze", "expand", "cat", "stack", "zerosLike")
@@ -1135,6 +1222,7 @@ def policy_digest() -> str:
                          "size_budget": [SIZE_BUDGET_BASE, SIZE_BUDGET_PER_PARAM, str(SIZE_BUDGET_SHARE),
                                          SIZE_BUDGET_SHARE_CAP, SIZE_BUDGET_CAP],
                          "last_bits": [list(LAST_BITS_LEVELS), list(LAST_BITS_RECORDED), LAST_BITS_COPIES, str(LAST_BITS_KEEP)],
+                         "runs": list(RUNS),
                          "plan_bounds": [PLAN_PER_INPUT, PLAN_BASE, PLAN_ENTRY_BITS, str(PLAN_BITS_SHARE)],
                          "general_kernel_budget_ms": GENERAL_KERNEL_BUDGET_MS,
                          "allowed_axioms": sorted(ALLOWED_AXIOMS), "trusted_prefixes": TRUSTED_PREFIXES}).encode())
@@ -1179,14 +1267,16 @@ def candidate_imports(ws: Path, module: str) -> tuple[list[str], list[str]]:
 
 
 def scoring_preview(ws: Path, module: str, checker: str, prot: dict, net_json: Path, lean: Path, lp: list[str],
-                    mode: str, plan: list | None = None, left_s: float | None = None) -> dict:
+                    mode: str, plan: list | None = None, left_s: float | None = None, read: int = 0) -> dict:
     """The scoring checks that need no kernel work, run on a development compile as the score step runs them:
     the counted-language closure of `checker` against the allowlist in force, its description size against
     the budget, with a plan the plan's bits against theirs, and the last-bits test (`last_bits`: what the
     compiled checker certifies on the network, with its bill, and on the copies; given PREVIEW_LAST_BITS_S at
     most, and no more than the call has left when the caller says so with left_s). A preview, not a verdict:
     the submission's score step also has the kernel check the soundness and instance theorems and times the
-    general layer."""
+    general layer. `run`, when the compiled checker gave a count: its count and bill on the network and the
+    length they make with a certificate of `read` numbers, which is what a submission with scored.run compiled
+    is given (policy v15)."""
     ps = checker.split(".")
     if len(ps) < 2 or ps[0] != "Candidate" or not all(IDENT.match(x) for x in ps):
         return {"error": "the checker must be a constant of the candidate, such as Candidate.MyChecker.D"}
@@ -1220,7 +1310,13 @@ def scoring_preview(ws: Path, module: str, checker: str, prot: dict, net_json: P
     if last.get("reason"):
         out["reason"] = last["reason"]
     if last.get("status") == "ok" and _work is not None:
-        out["last_bits"] = last_bits_preview(ws, mods, checker, prot, net_json, lean, lp_all, mode, plan is not None, left_s)
+        lb = last_bits_preview(ws, mods, checker, prot, net_json, lean, lp_all, mode, plan is not None, left_s)
+        out["last_bits"] = lb
+        if lb.get("count") is not None and extract is not None:
+            # the compiled checker's run on the network: with scored.run compiled this is the count and the bill a
+            # submission is given (policy v15), and the length they make with the certificate as it is now
+            out["run"] = {"count": lb["count"], "bill": lb["bill"], "extract": extract, "read": read,
+                          "length": lb["bill"] + extract + read}
     return out
 
 
@@ -1236,18 +1332,16 @@ def last_bits_preview(ws: Path, mods: list[str], checker: str, prot: dict, net_j
     pairs = [(m, str(ws / "out" / (m.replace(".", "/") + ".olean"))) for m in mods]
     res = last_bits_runs(checker, planned, prot, net_json, [(m, o) for m, o in pairs if os.path.isfile(o)], ws,
                          box_env(ws, lean, lp_all), mode, lean, lp_all, _work, timeout_s=limit)
-    if res["status"] == "replaced":
-        return {"passes": False, "reason": REPLACED.format(module=res["module"], by=res["by"])}
-    if res["status"] == "uncompiled":
-        return {"passes": False, "reason": UNCOMPILED.format(reason=res["reason"])}
     if res["status"] == "untyped":
         return {"passes": None, "reason": res["reason"]}
-    if res["status"] == "stopped" and not res["timed_out"]:
-        return {"passes": False, "reason": STOPPED.format(reason=res["reason"])}
+    if res["status"] in ("replaced", "uncompiled") or (res["status"] == "stopped" and not res["timed_out"]):
+        return {"passes": False, "reason": run_problem(res, "The service")}
     if res["status"] == "stopped":
-        return {"passes": None, "reason": f"not run to the end: {res['reason']}, which is what a preview gives the runs on the "
-                                          f"network and on {len(LAST_BITS_LEVELS + LAST_BITS_RECORDED) * LAST_BITS_COPIES} copies. "
-                                          "The submission's score step runs them in full"}
+        base = res.get("base") or {}  # the run on the network, when the time ran out on a copy
+        return {"passes": None, **({"count": base.get("count"), "bill": base.get("bill")} if base else {}),
+                "reason": f"not run to the end: {res['reason']}, which is what a preview gives the runs on the "
+                          f"network and on {len(LAST_BITS_LEVELS + LAST_BITS_RECORDED) * LAST_BITS_COPIES} copies. "
+                          "The submission's score step runs them in full"}
     if res["status"] == "error":
         return {"passes": None, "reason": "the test could not be run here: " + excerpt(res["reason"], 600, 300)}
     count = res["base"].get("count")
@@ -1295,7 +1389,8 @@ def compile_for_development(ws: Path, rel: str, repo: Path, model: str, network:
     if checker and ok:
         try:
             out["scoring_preview"] = scoring_preview(ws, module, checker, prot, net_json, lean, lp, mode, plan,
-                                                     None if limit_s is None else limit_s - (time.time() - t0))
+                                                     None if limit_s is None else limit_s - (time.time() - t0),
+                                                     read=len(cert or []))
         except (Reject, Unsupported, Infra) as exc:
             out["scoring_preview"] = {"error": str(exc)}
     return out
@@ -1352,7 +1447,8 @@ def main(argv=None) -> int:
     c.add_argument("--work", type=Path, required=True)
     c.add_argument("--model", required=True)
     c.add_argument("--network", required=True)
-    c.add_argument("--claimed", type=int, required=True)
+    c.add_argument("--claimed", type=int, default=0, help="the count a kernel instance will claim (it names the claim's "
+                                                          "protected module); 0 when the service runs the checker")
     c.add_argument("--certificate", type=Path)
     c.add_argument("--mode", default="hardened", choices=BOX_MODES)
     c.add_argument("--knowledge", default="minimal", choices=KNOWLEDGE_CONDITIONS)

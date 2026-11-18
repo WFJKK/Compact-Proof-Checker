@@ -1,0 +1,5 @@
+{"schema": "open-lane-candidate-v1", "candidate_id": "attn-max2-tiny-run", "model": "tests/attn_max2_tiny",
+ "network": "attn_max2_tiny-v8d4-s1",
+ "modules": ["Candidate/AttnTinyRun.lean"],
+ "scored": {"run": "compiled", "checker": "Candidate.AttnTinyRun.D", "sound": "Candidate.AttnTinyRun.D_sound",
+            "certificate": []}}

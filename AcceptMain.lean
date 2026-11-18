@@ -423,7 +423,7 @@ def protectedGraphOrTask (n : Name) : Bool :=
 def generalMayUse (_prot : Name) (n : Name) : Bool :=
   n.getRoot != `Protected || protectedGraphOrTask n
 
-def runScore (prot D sound inst : Name) (n bill : Nat) (trusted : List Name) (oleans : List String)
+def runScore (prot D sound : Name) (inst? : Option Name) (n bill : Nat) (trusted : List Name) (oleans : List String)
     (planned : Bool := false) : IO UInt32 := do
   initSearchPath (← findSysroot)
   let env ← importModules (trusted.toArray.map fun m => { module := m : Import }) {} (trustLevel := 0)
@@ -434,7 +434,7 @@ def runScore (prot D sound inst : Name) (n bill : Nat) (trusted : List Name) (ol
   let cs ← match ← candidateConstants kenv oleans with
     | .ok cs => pure cs
     | .error e => return ← rejected e
-  for c in [D, sound, inst] do
+  for c in [D, sound] ++ inst?.toList do
     if !cs.contains c then return ← rejected s!"the candidate has no constant {c}"
   -- the general layer: the checker and its soundness proof, with everything they depend on
   let general := dependencyClosure cs [D, sound]
@@ -462,16 +462,21 @@ def runScore (prot D sound inst : Name) (n bill : Nat) (trusted : List Name) (ol
     | .error e => return ← rejected e
   let t0 ← IO.monoMsNow
   let soundT := if planned then soundTypePlanned D (prot ++ `graph) (prot ++ `task) else soundType D (prot ++ `graph) (prot ++ `task)
-  let instT := if planned then instanceTypePlanned D (prot ++ `weights) (prot ++ `cert) (prot ++ `plan) n bill
-    else instanceType D (prot ++ `weights) (prot ++ `cert) n bill
   let kenv ← match ← challenge kenv `Challenge.sound soundT sound with
     | .ok k => pure k
     | .error e => return ← rejected e
-  let kenv ← match ← challenge kenv `Challenge.instance instT inst with
-    | .ok k => pure k
-    | .error e => return ← rejected e
+  -- the instance, when the candidate proves one. Without it (`sound`) the checker's run on the network is
+  -- not the kernel's: the service makes it with the compiled checker (`probe`), and says so in its receipt
+  let kenv ← match inst? with
+    | none => pure kenv
+    | some inst =>
+      let instT := if planned then instanceTypePlanned D (prot ++ `weights) (prot ++ `cert) (prot ++ `plan) n bill
+        else instanceType D (prot ++ `weights) (prot ++ `cert) n bill
+      match ← challenge kenv `Challenge.instance instT inst with
+      | .ok k => pure k
+      | .error e => return ← rejected e
   let challengeMs := (← IO.monoMsNow) - t0
-  let axioms := (axiomsOf kenv `Challenge.sound ++ axiomsOf kenv `Challenge.instance).toList.eraseDups.toArray.qsort Name.lt
+  let axioms := (axiomsOf kenv `Challenge.sound ++ (if inst?.isSome then axiomsOf kenv `Challenge.instance else #[])).toList.eraseDups.toArray.qsort Name.lt
   jsonOut [("status", "accepted"), ("reason", Json.null),
     ("axioms", Json.arr (axioms.map fun a => Json.str a.toString)), ("replayed", Lean.toJson cs.size),
     ("general", Json.mkObj [("constants", Lean.toJson general.size), ("checker_constants", Lean.toJson comp.size),
@@ -812,7 +817,8 @@ opaque evalChecker (prot D module : Name) (planned : Bool) :
 
     The output is one JSON object per line and the last line decides. Everything of the service's is done
     first (the modules read, the network files parsed, the protected certificate and plan evaluated); then
-    `{"status":"loaded"}`, and `{"status":"run","done":k}` after each run. So a process that ends without a
+    `{"status":"loaded"}`, and `{"status":"run","done":k,"count":n,"bill":b}` after each run, with what that
+    run gave (so the run on the network is known when a later run is stopped). So a process that ends without a
     last word (a stack that overflows, memory, the time limit) ended in the candidate's code exactly when
     `loaded` was written. -/
 def runProbe (prot D : Name) (planned : Bool) (nets : List String) (modules : List (String × String)) : IO UInt32 := do
@@ -845,10 +851,11 @@ def runProbe (prot D : Name) (planned : Bool) (nets : List String) (modules : Li
       return 0
   let mut runs : Array Json := #[]
   for w in weights do
-    runs := runs.push (match run w with
-      | some (n, bill) => Json.mkObj [("count", Lean.toJson n), ("bill", Lean.toJson bill)]
-      | none => Json.mkObj [("count", Json.null), ("bill", Json.null)])
-    jsonOutNow [("status", "run"), ("done", Lean.toJson runs.size)]
+    let (n, bill) := match run w with
+      | some (n, bill) => (Lean.toJson n, Lean.toJson bill)
+      | none => (Json.null, Json.null)
+    runs := runs.push (Json.mkObj [("count", n), ("bill", bill)])
+    jsonOutNow [("status", "run"), ("done", Lean.toJson runs.size), ("count", n), ("bill", bill)]
   jsonOut [("status", "ok"), ("runs", Json.arr runs)]
   return 0
 
@@ -858,6 +865,7 @@ def usage : String :=
   "usage: acceptcheck check <target> <candidate const> <trusted modules...> -- <candidate oleans...>\n" ++
   "       acceptcheck score <protected module> <checker> <sound> <instance> <count> <bill> <trusted modules...> -- <candidate oleans...>\n" ++
   "       acceptcheck score-planned <protected module> <checker> <sound> <instance> <count> <bill> <trusted modules...> -- <candidate oleans...>\n" ++
+  "       acceptcheck sound[-planned] <protected module> <checker> <sound> <trusted modules...> -- <candidate oleans...>\n" ++
   "       acceptcheck check-score <target> <candidate const> <protected module> <checker> <sound> <instance> <count> <bill> <trusted modules...> -- <candidate oleans...>\n" ++
   "       acceptcheck check-score-planned <target> <candidate const> <protected module> <checker> <sound> <instance> <count> <bill> <trusted modules...> -- <candidate oleans...>\n" ++
   "       acceptcheck lemma <theorem> <trusted modules...> -- <candidate oleans...>\n" ++
@@ -880,6 +888,17 @@ def checkScore (target cand prot D sound inst n bill : String) (rest : List Stri
     IO.eprintln usage
     return 2
 
+/-- `sound[-planned]`: the general part of a scored proof alone. Every constant of the candidate is replayed,
+    the general layer first and timed, and the kernel is asked for the soundness statement of the checker. No
+    instance is asked for: the service runs the compiled checker for the count and the bill (`probe`). -/
+def soundOnly (prot D sound : String) (rest : List String) (planned : Bool) : IO UInt32 := do
+  let (trusted, oleans) := rest.span (· != "--")
+  let oleans := oleans.drop 1
+  if oleans.isEmpty then
+    IO.eprintln usage
+    return 2
+  Accept.runScore prot.toName D.toName sound.toName none 0 0 (trusted.map String.toName) oleans (planned := planned)
+
 def main (args : List String) : IO UInt32 := do
   match args with
   | "check" :: target :: cand :: rest =>
@@ -897,7 +916,7 @@ def main (args : List String) : IO UInt32 := do
       if oleans.isEmpty then
         IO.eprintln usage
         return 2
-      Accept.runScore prot.toName D.toName sound.toName inst.toName n bill (trusted.map String.toName) oleans
+      Accept.runScore prot.toName D.toName sound.toName (some inst.toName) n bill (trusted.map String.toName) oleans
     | _, _ =>
       IO.eprintln usage
       return 2
@@ -909,10 +928,14 @@ def main (args : List String) : IO UInt32 := do
       if oleans.isEmpty then
         IO.eprintln usage
         return 2
-      Accept.runScore prot.toName D.toName sound.toName inst.toName n bill (trusted.map String.toName) oleans (planned := true)
+      Accept.runScore prot.toName D.toName sound.toName (some inst.toName) n bill (trusted.map String.toName) oleans (planned := true)
     | _, _ =>
       IO.eprintln usage
       return 2
+  | "sound" :: prot :: D :: sound :: rest =>
+    soundOnly prot D sound rest false
+  | "sound-planned" :: prot :: D :: sound :: rest =>
+    soundOnly prot D sound rest true
   | "check-score" :: target :: cand :: prot :: D :: sound :: inst :: n :: bill :: rest =>
     checkScore target cand prot D sound inst n bill rest false
   | "check-score-planned" :: target :: cand :: prot :: D :: sound :: inst :: n :: bill :: rest =>

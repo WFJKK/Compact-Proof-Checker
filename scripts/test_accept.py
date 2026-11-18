@@ -457,7 +457,7 @@ def test_a_checker_may_compare_a_list_with_the_empty_list(work, tmp_path):
     assert r["status"] == "accepted", r["reason"]
     s = r["scoring"]
     assert s["status"] == "scored", s
-    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v14"
+    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v15"
 
 
 # ---- the protected modules: the network apart from the claim (17 November 2026) --------------------------------
@@ -756,6 +756,11 @@ def test_the_preview_says_why_the_last_bits_test_could_not_say_anything(work, tm
     assert out["ok"] is True and lb["passes"] is None, out
     assert "not run to the end" in lb["reason"] and "did not finish within 10 s" in lb["reason"], lb
     assert "on the network" in lb["reason"] or "on copy" in lb["reason"], lb
+    if "on copy" in lb["reason"]:  # the run on the network was made: its count and bill are shown, and the length
+        assert lb["count"] is not None, lb
+        assert out["scoring_preview"]["run"]["count"] == lb["count"] and out["scoring_preview"]["run"]["bill"] == lb["bill"], out
+    else:
+        assert "count" not in lb and "run" not in out["scoring_preview"], out
 
 
 def test_what_ends_a_run_of_the_last_bits_test_is_laid_at_the_right_door(monkeypatch, tmp_path):
@@ -834,6 +839,144 @@ def test_a_probe_that_says_nothing_points_at_the_binary(monkeypatch, tmp_path):
     assert r["status"] == "error" and "did not start its runs" in r["reason"], r
 
 
+
+# ---- the run by compiled code (policy v15) ----
+
+RUN = PROJECT / "examples" / "open_lane" / "max2_tiny_run"
+RUN_SOURCE = (RUN / "Candidate" / "Max2TinyRun.lean").read_text()
+RUN_D = "def D : Checker := fun I => countSingles I graph task (allInputs task.space)"
+
+
+def run_variant(tmp_path: Path, name: str, lean: str | None = None, **changes) -> Path:
+    """A copy of the compiled-run example with its module's text or its manifest changed (`scored_` keys change
+    the scored block; None removes a key)."""
+    d = tmp_path / name
+    shutil.copytree(RUN, d)
+    if lean is not None:
+        (d / "Candidate" / "Max2TinyRun.lean").write_text(lean)
+    m = json.loads((d / "manifest.json").read_text())
+    m["candidate_id"] = name
+    for k, v in changes.items():
+        target, key = (m["scored"], k[len("scored_"):]) if k.startswith("scored_") else (m, k)
+        if v is None:
+            target.pop(key, None)
+        else:
+            target[key] = v
+    (d / "manifest.json").write_text(json.dumps(m))
+    return d
+
+
+def test_a_proof_whose_run_the_service_makes_is_scored_by_the_compiled_run(work):
+    """examples/open_lane/max2_tiny_run: the checker and the soundness theorem of the brute-force example and
+    nothing else, with `"run": "compiled"`. The kernel checks soundness; the service runs the compiled checker
+    for the count and the bill. They are the count and the bill the kernel establishes for the same checker
+    (max2_tiny_scored), the length is the same, and the receipt says which run it was."""
+    kernel = submit(SCORED, work)
+    r = submit(RUN, work)
+    assert r["status"] == "accepted" and r["certified_count"] == 64, r["reason"]
+    assert r["run"] == "compiled" and r["claimed_count"] is None and r["theorem"] == "Candidate.Max2TinyRun.D_sound"
+    assert set(r["axioms"]) <= {"propext", "Classical.choice", "Quot.sound"} and r["axioms"]
+    s, k = r["scoring"], kernel["scoring"]
+    assert s["status"] == "scored" and s["run"] == "compiled" and s["assurance"] == "compiled_instance", s
+    assert (s["bill"], s["length"], s["extract"], s["read"]) == (k["bill"], k["length"], k["extract"], k["read"]) == (4032, 4112, 80, 0)
+    assert s["description_size"] == k["description_size"] and s["size_budget"] == k["size_budget"]
+    assert r["score_eligible"] is True and r["execution_assurance"] == "compiled_instance"
+    assert kernel["run"] == "kernel" and k["run"] == "kernel" and kernel["execution_assurance"] == "kernel_checked_instance"
+    # one process makes the run and the last-bits copies: the same test, on the same runs
+    assert s["last_bits"]["passed"] is True and s["last_bits"]["runs"] == k["last_bits"]["runs"]
+    assert [x["step"] for x in r["steps"]] == ["protected", "compile", "closure", "kernel", "run"]
+    assert next(x for x in r["steps"] if x["step"] == "kernel")["scores"] is True
+    assert r["policy_version"] == "open-lane-policy-v15"
+
+
+def general_layer(source: str, claim_module: str, network_module: str) -> str:
+    """A scored example's module without its specific layer (the instance and the target), importing the
+    network's own protected module: what a submission with the run left to the service holds."""
+    a, b = source.index("/-! ## Specific layer -/"), source.rindex("\nend Candidate.")
+    return (source[:a] + source[b + 1:]).replace(claim_module, network_module)
+
+
+def test_the_compiled_run_keeps_every_scoring_condition(work, tmp_path):
+    """Leaving the run to the service changes who does the arithmetic and nothing about what is scored. A
+    checker whose count hangs on a stored weight is sound, so it has its count, and is refused scoring by the
+    last-bits test, made on the same runs, with its measured length kept. A theorem the kernel does not find to
+    be the soundness statement of the checker is rejected, and no count is reported."""
+    d = tmp_path / "run-stored"
+    (d / "Candidate").mkdir(parents=True)
+    (d / "Candidate" / "StoredWeight.lean").write_text(
+        general_layer((STORED / "Candidate" / "StoredWeight.lean").read_text(), "Protected.N_max2_tiny_v8_s0_c64",
+                      "Protected.N_max2_tiny_v8_s0"))
+    (d / "manifest.json").write_text(json.dumps({
+        "schema": "open-lane-candidate-v1", "candidate_id": "run-stored", "model": "tests/max2_tiny",
+        "network": "max2_tiny-v8-s0", "modules": ["Candidate/StoredWeight.lean"],
+        "scored": {"run": "compiled", "checker": "Candidate.StoredWeight.D", "sound": "Candidate.StoredWeight.D_sound",
+                   "certificate": []}}))
+    r = submit(d, work)
+    assert r["status"] == "accepted" and r["certified_count"] == 64 and r["run"] == "compiled", r["reason"]
+    s = r["scoring"]
+    assert s["status"] == "refused" and "last-bits test" in s["reason"] and "certifies 0 inputs" in s["reason"], s
+    assert s["bill"] is None and s["length"] is None and r["score_eligible"] is False and r["execution_assurance"] is None
+    assert s["measured_bill"] == 64 * 63 + 64 + 4 and s["measured_length"] == s["measured_bill"] + 80
+    assert {x["count"] for x in s["last_bits"]["runs"]} == {0}
+    # a theorem that is not the soundness statement
+    r = submit(run_variant(tmp_path, "run-not-sound", RUN_SOURCE.replace(
+        "\nend Candidate.Max2TinyRun", "\ntheorem easy : True := trivial\n\nend Candidate.Max2TinyRun"),
+        scored_sound="Candidate.Max2TinyRun.easy"), work)
+    assert r["status"] == "rejected" and r["certified_count"] is None and "Challenge.sound" in r["reason"], r
+    assert [x["step"] for x in r["steps"]][-1] == "kernel"  # nothing was run
+
+
+def test_the_compiled_run_of_the_attention_example_gives_the_bill_its_kernel_facts_prove(work):
+    """examples/open_lane/attn_max2_tiny_run: the checker and soundness theorem of attn_max2_tiny_scored, one
+    module. That example's instance is 64 kernel theorems and their glue, because one theorem's memory does not
+    hold the run; here the service runs the compiled checker, and gets the bill those theorems prove."""
+    kernel = json.loads((PROJECT / "examples" / "open_lane" / "attn_max2_tiny_scored" / "manifest.json").read_text())
+    r = submit(PROJECT / "examples" / "open_lane" / "attn_max2_tiny_run", work)
+    assert r["status"] == "accepted" and r["run"] == "compiled", r["reason"]
+    assert r["certified_count"] == kernel["claimed_count"] == 64
+    s = r["scoring"]
+    assert s["status"] == "scored" and s["bill"] == kernel["scored"]["claimed_bill"] == 64 * 191, s
+    assert s["length"] == s["bill"] + s["extract"] and s["last_bits"]["passed"] is True
+
+
+def test_the_compiled_run_needs_a_checker_that_runs(work, tmp_path):
+    """With the run left to the service a checker that cannot be run compiled has no count at all: rejected, with
+    the reason (in kernel mode the same proof is verified and only refused scoring)."""
+    r = submit(run_variant(tmp_path, "run-noncomputable", RUN_SOURCE.replace(RUN_D, "noncomputable " + RUN_D)), work)
+    assert r["status"] == "rejected" and r["certified_count"] is None, r
+    assert "no compiled code" in r["reason"] and "The service runs the checker compiled" in r["reason"], r
+    assert [x["step"] for x in r["steps"]][-2:] == ["kernel", "run"] and r["steps"][-1]["status"] == "uncompiled"
+
+
+def test_a_manifest_says_one_thing_about_the_run(work, tmp_path):
+    """`scored.run` is kernel (the default: an instance theorem and a claimed count, as before) or compiled (no
+    instance and no claimed bill). A manifest that mixes them is rejected before anything is compiled, so that no
+    count is ever read from the wrong place. A claimed_count with a compiled run claims nothing: as for a lemma
+    it names the claim's protected module, for modules written against it."""
+    cases = {"with-instance": ({"scored_instance": "Candidate.Max2TinyRun.D_instance"}, "there is no scored.instance"),
+             "with-bill": ({"scored_claimed_bill": 4032}, "there is no scored.claimed_bill"),
+             "claim-not-a-number": ({"claimed_count": "64"}, "claimed_count must be a natural number"),
+             "other-theorem": ({"theorem": "Candidate.Max2TinyRun.countSingles_le"}, "the theorem is scored.sound"),
+             "unknown-run": ({"scored_run": "native"}, "scored.run must be one of"),
+             "no-sound": ({"scored_sound": None}, "scored.sound must be a constant name")}
+    for name, (changes, said) in cases.items():
+        r = submit(run_variant(tmp_path, "run-" + name, **changes), work)
+        assert r["status"] == "rejected" and said in r["reason"] and r["steps"] == [], (name, r)
+    # and the kernel's way still needs what it needed
+    d = variant(tmp_path, "kernel-no-instance", base=SCORED)
+    m = json.loads((d / "manifest.json").read_text())
+    del m["scored"]["instance"]
+    (d / "manifest.json").write_text(json.dumps(m))
+    r = submit(d, work)
+    assert r["status"] == "rejected" and "scored.instance must be a constant name" in r["reason"], r
+    # a module written against a claim's protected module, as every module of a kernel-instance proof is: the
+    # count it names (7, which the checker does not certify) is no claim, and the run's count is the result
+    r = submit(run_variant(tmp_path, "run-named-claim", RUN_SOURCE.replace("Protected.N_max2_tiny_v8_s0", "Protected.N_max2_tiny_v8_s0_c7"),
+                           claimed_count=7), work)
+    assert r["status"] == "accepted" and r["certified_count"] == 64 and r["claimed_count"] is None, r
+    assert r["scoring"]["status"] == "scored" and r["steps"][0]["module"] == "Protected.N_max2_tiny_v8_s0_c7", r
+
+
 # ---- planned checkers (policy v9) ---------------------------------------------------------------------------
 PLANNED = PROJECT / "examples" / "open_lane" / "max2_tiny_planned"
 PLANNED_SOURCE = (PLANNED / "Candidate" / "Max2TinyPlanned.lean").read_text()
@@ -868,7 +1011,7 @@ def test_a_planned_checker_is_scored_and_its_plan_is_free(work):
     assert s["bill"] == 60 * 63 and s["read"] == 0 and s["length"] == s["bill"] + s["extract"] + s["read"]
     assert s["plan_entries"] == 64 and s["description_size"] <= s["size_budget"]
     assert s["plan_bits"] == 184 <= s["plan_bits_budget"] == s["weight_bits"] // 4  # 60 ones, 4 zeros: 60 * 3 + 4
-    assert r["policy_version"] == "open-lane-policy-v14"
+    assert r["policy_version"] == "open-lane-policy-v15"
 
 
 def test_a_planned_soundness_proof_must_hold_for_every_plan(work, tmp_path):
@@ -1053,6 +1196,8 @@ def test_the_development_compile_previews_the_scoring_checks(work, tmp_path):
     lb = p["last_bits"]
     assert (lb["count"], lb["bill"]) == (64, final["bill"]) and lb["passes"] is True and lb["holds_to"] == 8, lb
     assert lb["runs"] == final["last_bits"]["runs"] and lb["least_count_on_copies"] == 64, (lb, final["last_bits"])
+    # and the run itself: with the run left to the service (policy v15) this is the score a submission gets
+    assert p["run"] == {"count": 64, "bill": final["bill"], "extract": final["extract"], "read": 0, "length": final["length"]}, p
     # outside the counted language: the preview names the constants the score step would
     bare = SCORED_SOURCE.replace(NEW_D,
                                  "def D : Checker := fun I => countSingles I graph task "
@@ -1590,7 +1735,7 @@ def test_a_checker_may_build_a_graph_of_the_linear_family_and_run_single_on_it(w
     assert r["status"] == "accepted" and r["certified_count"] == 64, r["reason"]
     s = r["scoring"]
     assert s["status"] == "scored", s
-    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v14"
+    assert s["bill"] == 64 * 63 and r["policy_version"] == "open-lane-policy-v15"
 
 
 def test_weight_sizes_are_read_for_free(work, tmp_path):

@@ -292,6 +292,13 @@ the weights certifies the same, one that rests on a stored copy certifies nothin
 Neither sees a copy that is rounded and compared with a tolerance; on small networks that is left to
 someone reading the checker.
 
+Since policy v15 (18 November) a scored proof may leave the checker's run on the network to the service
+(`"run": "compiled"` in the scored block): the kernel checks the soundness theorem, and the count and the
+bill are the compiled checker's run. That is arithmetic the kernel is slow at (about 400 s against about 1 s
+on the run of attn-min2-ptl-3's proof), and most of a proof's modules existed to get it through the kernel.
+What is trusted beyond the kernel is then Lean's compiler, for that one evaluation; the receipt says which
+it was. The kernel's instance stays the default (docs/COUNTED.md, "The run by compiled code").
+
 **Open lane.** With $`\mathrm{cert}`$ the certificate (numbers the proof passes to D),
 
 ```math
